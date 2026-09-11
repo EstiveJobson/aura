@@ -2,6 +2,7 @@ from sqlalchemy import text
 
 from app.database.base import Base
 from app.database.session import create_database_engine, create_session_factory
+from app.models import Execution, Plan, Task, ToolCall  # noqa: F401
 
 
 def test_database_foundation_builds_a_working_session() -> None:
@@ -14,4 +15,4 @@ def test_database_foundation_builds_a_working_session() -> None:
     finally:
         engine.dispose()
 
-    assert not Base.metadata.tables
+    assert set(Base.metadata.tables) == {"tasks", "plans", "executions", "tool_calls"}
