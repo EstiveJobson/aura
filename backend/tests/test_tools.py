@@ -1,0 +1,50 @@
+from pathlib import Path
+
+import pytest
+
+from app.agents import MockPlanner
+from app.tools import PermissionLevel, ToolError, ToolExecutor, ToolRegistry, WorkspaceListTool
+
+
+def test_mock_planner_is_deterministic_and_produces_exactly_one_step() -> None:
+    planner = MockPlanner()
+
+    first = planner.create_plan("List this workspace.")
+    second = planner.create_plan("List this workspace.")
+
+    assert first == second
+    assert first.planner == "mock-planner-v1"
+    assert len(first.steps) == 1
+    assert first.steps[0].tool_name == "workspace_list"
+    assert first.steps[0].arguments == {}
+
+
+def test_registry_executes_only_registered_read_only_workspace_tool(tmp_path: Path) -> None:
+    (tmp_path / "zeta.txt").write_text("zeta", encoding="utf-8")
+    (tmp_path / "Alpha").mkdir()
+    registry = ToolRegistry()
+    tool = WorkspaceListTool(tmp_path)
+    registry.register(tool)
+
+    result = ToolExecutor(registry).execute("workspace_list", {})
+
+    assert [definition.name for definition in registry.definitions()] == ["workspace_list"]
+    assert registry.definitions()[0].permission is PermissionLevel.READ
+    assert result["entry_count"] == 2
+    assert result["entries"] == [
+        {"name": "Alpha", "kind": "directory"},
+        {"name": "zeta.txt", "kind": "file"},
+    ]
+
+
+def test_registry_rejects_duplicate_and_unknown_tools(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    tool = WorkspaceListTool(tmp_path)
+    registry.register(tool)
+
+    with pytest.raises(ValueError, match="already registered"):
+        registry.register(tool)
+    with pytest.raises(ToolError, match="not registered"):
+        ToolExecutor(registry).execute("missing", {})
+    with pytest.raises(ToolError, match="could not be executed safely"):
+        ToolExecutor(registry).execute("workspace_list", {"unexpected": True})
