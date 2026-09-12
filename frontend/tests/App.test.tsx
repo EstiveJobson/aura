@@ -75,7 +75,7 @@ const failedPlanningTask: TaskResponse = {
   ...completedTask,
   status: 'failed',
   result: null,
-  error: 'The deterministic planner could not create a plan.',
+  error: 'The planner could not create a plan.',
   plan: null,
   execution: null,
 };
@@ -108,10 +108,10 @@ afterEach(() => {
 });
 
 describe('App', () => {
-  it('renders the Phase 1 task form and read-only boundary', () => {
+  it('renders the Phase 2 task form and read-only boundary', () => {
     const markup = renderToStaticMarkup(<App />);
 
-    expect(markup).toContain('First agent workflow');
+    expect(markup).toContain('Bounded agent workflow');
     expect(markup).toContain('Task instruction');
     expect(markup).toContain('workspace_list · read only');
   });

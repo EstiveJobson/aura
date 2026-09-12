@@ -2,20 +2,37 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.agents import AgentEngine, MockPlanner
+from app.agents import AgentEngine, LLMPlanner, MockPlanner, Planner
 from app.api.routes import router as api_router
-from app.core.config import Settings, get_settings
+from app.core.config import PlannerBackend, Settings, get_settings
 from app.database.session import create_database_engine, create_session_factory
+from app.providers import OpenAIProvider
 from app.tools import ToolExecutor, ToolRegistry, WorkspaceListTool
 
 
 def build_agent_engine(settings: Settings) -> AgentEngine:
     registry = ToolRegistry()
     registry.register(WorkspaceListTool(settings.workspace_root))
+    planner: Planner
+    planner_name: str
+    if settings.planner_backend is PlannerBackend.MOCK:
+        planner = MockPlanner()
+        planner_name = "mock-planner-v1"
+    else:
+        if settings.openai_api_key is None:
+            raise ValueError("OpenAI provider configuration is incomplete.")
+        provider = OpenAIProvider(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            timeout_seconds=settings.ai_provider_timeout_seconds,
+            max_output_tokens=settings.ai_provider_max_output_tokens,
+        )
+        planner = LLMPlanner(provider, registry.definitions())
+        planner_name = f"openai-{settings.openai_model}"
     return AgentEngine(
-        MockPlanner(),
+        planner,
         ToolExecutor(registry),
-        planner_name="mock-planner-v1",
+        planner_name=planner_name,
     )
 
 

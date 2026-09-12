@@ -51,13 +51,14 @@ class AgentEngine:
             generated = self._planner.create_plan(instruction)
         except Exception as exc:
             raise AgentExecutionError(
-                "The deterministic planner could not create a plan.",
+                "The planner could not create a plan.",
                 stage="planner",
             ) from exc
 
         try:
             validated = GeneratedPlan.model_validate(generated)
-            self._tool_executor.validate_tool(validated.steps[0].tool_name)
+            step = validated.steps[0]
+            self._tool_executor.validate_call(step.tool_name, step.arguments)
         except (ValidationError, ToolError) as exc:
             raise AgentExecutionError(
                 "The generated plan was rejected.",

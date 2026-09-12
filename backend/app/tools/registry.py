@@ -34,6 +34,13 @@ class ToolExecutor:
     def validate_tool(self, name: str) -> None:
         self._registry.get(name)
 
+    def validate_call(self, name: str, arguments: dict[str, Any]) -> None:
+        tool = self._registry.get(name)
+        try:
+            tool.validate_arguments(arguments)
+        except Exception as exc:
+            raise ToolError(f'Tool "{name}" received invalid arguments.') from exc
+
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         tool = self._registry.get(name)
         try:

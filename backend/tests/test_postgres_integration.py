@@ -12,7 +12,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents import AgentEngine, GeneratedPlan, MockPlanner, PlannedStep, Planner
-from app.core.config import Settings
+from app.core.config import PlannerBackend, Settings
 from app.database.session import create_database_engine, create_session_factory
 from app.main import create_app
 from app.models import Execution, ExecutionStatus, Task, TaskStatus, ToolCall, ToolCallStatus
@@ -48,6 +48,9 @@ class PostgreSQLFailureTool:
 
     def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("PostgreSQL integration failure detail must stay private.")
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> None:
+        return None
 
 
 @pytest.fixture
@@ -108,6 +111,7 @@ def build_postgres_application(
         Settings(
             database_url=os.environ["AURA_POSTGRES_TEST_URL"],
             workspace_root=tmp_path,
+            planner_backend=PlannerBackend.MOCK,
         ),
         session_factory=session_factory,
         agent_engine=engine,

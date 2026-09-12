@@ -11,11 +11,12 @@ from sqlalchemy import Engine, create_engine, func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.agents import AgentEngine, GeneratedPlan, PlannedStep
-from app.core.config import Settings
+from app.agents import AgentEngine, GeneratedPlan, LLMPlanner, PlannedStep
+from app.core.config import PlannerBackend, Settings
 from app.database.base import Base
 from app.main import create_app
 from app.models import Execution, ExecutionStatus, Plan, Task, TaskStatus, ToolCall, ToolCallStatus
+from app.providers import ProviderTimeoutError, StructuredGenerationRequest
 from app.services.tasks import PERSISTED_FAILURE_MESSAGE
 from app.tools import (
     PermissionLevel,
@@ -41,9 +42,24 @@ class MissingToolPlanner:
         )
 
 
-class PlannerFailure:
+class PlannerFailureProvider:
+    def generate(self, request: StructuredGenerationRequest) -> dict[str, Any]:
+        raise ProviderTimeoutError("raw provider payload with api_key=do-not-log")
+
+
+class InvalidArgumentsPlanner:
     def create_plan(self, instruction: str) -> GeneratedPlan:
-        raise RuntimeError("raw provider payload with api_key=do-not-log")
+        return GeneratedPlan(
+            summary="Reject arbitrary path arguments.",
+            steps=(
+                PlannedStep(
+                    sequence=1,
+                    title="Attempt an invalid path",
+                    tool_name="workspace_list",
+                    arguments={"path": "../outside"},
+                ),
+            ),
+        )
 
 
 class ExplodingToolPlanner:
@@ -73,6 +89,9 @@ class ExplodingTool:
 
     def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("credential=do-not-log")
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> None:
+        return None
 
 
 class CompletionCommitFailureSession(Session):
@@ -116,6 +135,7 @@ def build_test_application(
     settings = Settings(
         database_url=f"sqlite+pysqlite:///{database_path.as_posix()}",
         workspace_root=tmp_path,
+        planner_backend=PlannerBackend.MOCK,
     )
     application = create_app(
         settings,
@@ -235,7 +255,7 @@ def test_planner_failure_is_sanitized_persisted_and_logged_once(
     registry = ToolRegistry()
     registry.register(WorkspaceListTool(tmp_path))
     failing_engine = AgentEngine(
-        PlannerFailure(),
+        LLMPlanner(PlannerFailureProvider(), registry.definitions()),
         ToolExecutor(registry),
         planner_name="failure-test-planner",
     )
@@ -249,7 +269,7 @@ def test_planner_failure_is_sanitized_persisted_and_logged_once(
     assert response.status_code == 201
     body = response.json()
     assert body["status"] == "failed"
-    assert body["error"] == "The deterministic planner could not create a plan."
+    assert body["error"] == "The planner could not create a plan."
     assert body["plan"] is None
     assert body["execution"] is None
     failure_records = [
@@ -260,6 +280,31 @@ def test_planner_failure_is_sanitized_persisted_and_logged_once(
     assert len(failure_records) == 1
     assert getattr(failure_records[0], "failure_stage", None) == "planner"
     assert "api_key" not in caplog.text
+    engine.dispose()
+
+
+def test_invalid_tool_arguments_are_rejected_before_plan_persistence(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    registry.register(WorkspaceListTool(tmp_path))
+    failing_engine = AgentEngine(
+        InvalidArgumentsPlanner(),
+        ToolExecutor(registry),
+        planner_name="failure-test-planner",
+    )
+    application, session_factory, engine = build_test_application(tmp_path, failing_engine)
+
+    response = asyncio.run(
+        request(application, "POST", "/api/tasks", json={"instruction": "List elsewhere."})
+    )
+
+    assert response.status_code == 201
+    assert response.json()["status"] == "failed"
+    assert response.json()["error"] == "The generated plan was rejected."
+    assert response.json()["plan"] is None
+    with session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Plan)) == 0
+        assert session.scalar(select(func.count()).select_from(Execution)) == 0
+        assert session.scalar(select(func.count()).select_from(ToolCall)) == 0
     engine.dispose()
 
 

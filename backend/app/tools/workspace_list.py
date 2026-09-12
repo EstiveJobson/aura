@@ -28,7 +28,7 @@ class WorkspaceListTool:
         )
 
     def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        WorkspaceListArguments.model_validate(arguments)
+        self.validate_arguments(arguments)
         entries = [
             {"name": entry.name, "kind": "directory" if entry.is_dir() else "file"}
             for entry in sorted(
@@ -43,3 +43,6 @@ class WorkspaceListTool:
             "entry_count": count,
             "summary": f"Found {count} top-level {noun} in the configured workspace.",
         }
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> None:
+        WorkspaceListArguments.model_validate(arguments)

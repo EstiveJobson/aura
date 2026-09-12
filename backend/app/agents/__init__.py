@@ -1,7 +1,14 @@
-"""Agent boundary reserved for the Phase 1 vertical slice."""
+"""Validated single-step agent planning and execution boundary."""
 
 from app.agents.engine import AgentEngine, AgentExecutionError, AgentExecutionResult
-from app.agents.planner import ExecutionPlan, GeneratedPlan, MockPlanner, PlannedStep, Planner
+from app.agents.planner import (
+    ExecutionPlan,
+    GeneratedPlan,
+    LLMPlanner,
+    MockPlanner,
+    PlannedStep,
+    Planner,
+)
 
 __all__ = [
     "AgentEngine",
@@ -9,6 +16,7 @@ __all__ = [
     "AgentExecutionResult",
     "ExecutionPlan",
     "GeneratedPlan",
+    "LLMPlanner",
     "MockPlanner",
     "PlannedStep",
     "Planner",

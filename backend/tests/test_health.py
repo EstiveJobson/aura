@@ -2,7 +2,7 @@ import asyncio
 
 from httpx2 import ASGITransport, AsyncClient, Response
 
-from app.core.config import Settings
+from app.core.config import PlannerBackend, Settings
 from app.main import create_app
 
 
@@ -12,6 +12,7 @@ async def request_health() -> Response:
             api_prefix="/api",
             database_url="postgresql+psycopg://aura:aura@localhost:5432/aura",
             cors_origins=["http://localhost:5173"],
+            planner_backend=PlannerBackend.MOCK,
         )
     )
     transport = ASGITransport(app=application)
