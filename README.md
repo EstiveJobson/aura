@@ -4,31 +4,32 @@
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![React](https://img.shields.io/badge/React-TypeScript-149ECA.svg?logo=react&logoColor=white)](https://react.dev/)
 
-AURA is an agentic workspace and AI orchestration platform conceived as a portfolio-grade software engineering project. The repository is currently at **Phase 2: real AI provider**: a user can create a task, run one bounded read-only agent workflow with either the deterministic planner or an OpenAI-backed planner, and inspect its persisted result.
+AURA is an agentic workspace and AI orchestration platform conceived as a portfolio-grade software engineering project. The repository is currently at **Phase 3: tooling and approvals**: a user can create a one-step task, let the configured planner choose among bounded workspace tools, and explicitly approve or reject file moves before execution.
 
 The project scope and implementation order are governed by [`AURA_Project_Blueprint_A3.pdf`](AURA_Project_Blueprint_A3.pdf).
 
-## Phase 2 capabilities
+## Phase 3 capabilities
 
 - FastAPI application with a typed `GET /api/health` endpoint and OpenAPI documentation.
-- Typed `POST /api/tasks` and `GET /api/tasks/{task_id}` endpoints for the synchronous task flow.
+- Typed task creation/retrieval endpoints plus payload-free approval and rejection endpoints for persisted pending executions.
 - Deterministic `MockPlanner` for tests and local development, selected by default.
 - Vendor-neutral `AIProvider` contract and an OpenAI Responses API adapter selected through environment configuration.
-- `LLMPlanner` that requests strict structured output and locally validates one plan step, registered tool identity, field bounds, and tool arguments before persistence or execution.
-- Agent engine, tool interface, registry, executor, and exactly one registered `workspace_list` tool.
-- Read-only workspace listing constrained to the configured `WORKSPACE_ROOT`.
-- PostgreSQL persistence for tasks, plans, executions, tool calls, statuses, and results through SQLAlchemy and Alembic.
-- React, TypeScript, and Vite task execution UI with operational status, plan, tool, and result details.
+- `LLMPlanner` that receives all registered tool schemas, requests strict structured output, and locally validates exactly one selected tool call before persistence or execution.
+- Explicit application-owned `READ`/`WRITE` permissions: reads execute automatically and writes cannot execute without approval.
+- `workspace_list`, bounded literal `workspace_search`, bounded UTF-8 `workspace_read`, and approval-required `workspace_move` tools.
+- Fixed-root path validation that rejects absolute paths, traversal, symlink escapes, oversized reads, binary reads, and destination overwrites.
+- PostgreSQL persistence for tasks, plans, executions, tool calls, approval decisions, statuses, and results through SQLAlchemy and Alembic.
+- React, TypeScript, and Vite UI for planning, waiting, executing, completed, rejected, and failed states, including guarded Approve/Reject controls.
 - Reproducible local services through Docker Compose.
 - Backend linting, formatting, static typing, tests, and coverage enforcement.
 - Frontend linting, formatting, static typing, tests, and production builds.
 - GitHub Actions checks for every push and pull request.
 
-Additional tools, approvals, authentication, memory, multiple agents, streaming, autonomous loops, arbitrary filesystem access, and destructive actions remain intentionally out of scope.
+Authentication, memory, multiple agents, streaming, autonomous loops, arbitrary filesystem access, deletion, shell access, and code execution remain intentionally out of scope.
 
 ## Architecture
 
-Phase 2 preserves the modular monolith and the existing end-to-end execution path:
+Phase 3 preserves the modular monolith and the existing end-to-end execution path:
 
 ```mermaid
 flowchart LR
@@ -40,8 +41,11 @@ flowchart LR
     PLANNER --> LLM[LLMPlanner]
     LLM --> PROVIDER[AIProvider]
     PROVIDER --> OPENAI[OpenAI Responses API]
-    ENGINE --> REGISTRY[Tool Registry]
-    REGISTRY --> TOOL[workspace_list]
+    ENGINE --> REGISTRY[Tool Registry and permission policy]
+    REGISTRY --> READ[READ tools auto-run]
+    REGISTRY --> WRITE[workspace_move WRITE]
+    WRITE --> APPROVAL[Persisted approval gate]
+    APPROVAL -->|approve or reject| SERVICE
     SERVICE --> DB[(PostgreSQL)]
     MIG[Alembic] --> DB
 ```
@@ -57,7 +61,7 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-The backend applies pending Alembic migrations before starting the API. The configured container workspace is `/app`, so `workspace_list` lists the backend application workspace without accepting arbitrary paths.
+The backend applies pending Alembic migrations before starting the API. Application code remains under `/app`, while the host `workspace/` directory is mounted at the isolated container path `/workspace`. Every tool accepts only validated paths relative to that workspace root. `workspace_move` never overwrites and always waits for explicit approval.
 
 The local development defaults in `.env.example` are not production credentials. Change them for any shared environment.
 
@@ -90,7 +94,7 @@ npm run dev
 
 Copy `.env.example` to `.env` before starting the backend and adjust `DATABASE_URL` when PostgreSQL is not on `localhost:5432`.
 
-The backend always loads the repository-root `.env`, matching the documented copy location. The example uses `WORKSPACE_ROOT=..` because the local backend command runs from `backend/`; Docker Compose overrides it with `/app`.
+The backend always loads the repository-root `.env`, matching the documented copy location. The example uses `WORKSPACE_ROOT=../workspace` because the local backend command runs from `backend/`; Docker Compose uses the matching isolated container path `/workspace`.
 
 `PLANNER_BACKEND=mock` is the default and requires no provider credentials. To use the real provider, set these values in the untracked root `.env` before starting the backend:
 
@@ -130,7 +134,7 @@ Backend coverage is enforced at 80%. Frontend tests use Vitest. The automated su
 | `POSTGRES_PASSWORD` | Local PostgreSQL password used by Compose.        |
 | `DATABASE_URL`      | SQLAlchemy PostgreSQL connection URL.             |
 | `CORS_ORIGINS`      | JSON array of browser origins allowed by FastAPI. |
-| `WORKSPACE_ROOT`    | Fixed directory available to the read-only tool.  |
+| `WORKSPACE_ROOT`    | Fixed directory available to bounded workspace tools. |
 | `PLANNER_BACKEND`   | `mock` (default) or `openai`.                      |
 | `OPENAI_API_KEY`    | Required only when `PLANNER_BACKEND=openai`.       |
 | `OPENAI_MODEL`      | OpenAI model used for structured planning.         |
@@ -143,7 +147,8 @@ Backend coverage is enforced at 80%. Frontend tests use Vitest. The automated su
 - **Phase 0 - Foundation:** complete; repository, docs, Docker, application skeletons, PostgreSQL, and CI.
 - **Phase 1 - MVP vertical slice:** complete; create task, deterministic mock plan, one tool, result persistence, and dashboard display.
 - **Phase 2 - Real AI provider:** complete; switchable provider abstraction and validated single-step structured planning.
-- **Phases 3-5:** approvals, broader tooling, memory, observability, and portfolio polish.
+- **Phase 3 - Tooling and approvals:** complete; multiple bounded tools, application-enforced permissions, and persisted approval lifecycle.
+- **Phases 4-5:** memory, observability, and portfolio polish.
 
 See [Architecture](docs/architecture.md) for boundaries and [Contributing](CONTRIBUTING.md) for the development workflow.
 

@@ -8,6 +8,7 @@ from app.core.constraints import TOOL_NAME_MAX_LENGTH
 
 class PermissionLevel(StrEnum):
     READ = "read"
+    WRITE = "write"
 
 
 class ToolDefinition(BaseModel):

@@ -1,17 +1,18 @@
 export type TaskStatus =
-  'pending' | 'planning' | 'executing' | 'succeeded' | 'failed';
+  | 'pending'
+  | 'planning'
+  | 'waiting_for_approval'
+  | 'executing'
+  | 'succeeded'
+  | 'rejected'
+  | 'failed';
 
 export interface WorkspaceEntry {
   name: string;
   kind: 'directory' | 'file';
 }
 
-export interface ToolResult {
-  workspace: string;
-  entries: WorkspaceEntry[];
-  entry_count: number;
-  summary: string;
-}
+export type ToolResult = Record<string, unknown>;
 
 export interface PlannedStep {
   sequence: number;
@@ -37,7 +38,8 @@ export interface TaskResponse {
   } | null;
   execution: {
     id: string;
-    status: 'running' | 'succeeded' | 'failed';
+    status:
+      'waiting_for_approval' | 'running' | 'succeeded' | 'rejected' | 'failed';
     result: ToolResult | null;
     error: string | null;
     started_at: string;
@@ -46,12 +48,23 @@ export interface TaskResponse {
       id: string;
       tool_name: string;
       arguments: Record<string, unknown>;
-      status: 'running' | 'succeeded' | 'failed';
+      status:
+        | 'waiting_for_approval'
+        | 'running'
+        | 'succeeded'
+        | 'rejected'
+        | 'failed';
       result: ToolResult | null;
       error: string | null;
       started_at: string;
       completed_at: string | null;
     }>;
+    approval: {
+      id: string;
+      decision: 'pending' | 'approved' | 'rejected';
+      requested_at: string;
+      decided_at: string | null;
+    } | null;
   } | null;
 }
 
@@ -73,4 +86,35 @@ export async function createTask(
   }
 
   return (await response.json()) as TaskResponse;
+}
+
+async function decideTask(
+  taskId: string,
+  decision: 'approve' | 'reject',
+  request: typeof fetch,
+): Promise<TaskResponse> {
+  const response = await request(`${apiBaseUrl}/tasks/${taskId}/${decision}`, {
+    method: 'POST',
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Task ${decision} request failed with status ${response.status}.`,
+    );
+  }
+  return (await response.json()) as TaskResponse;
+}
+
+export function approveTask(
+  taskId: string,
+  request: typeof fetch = fetch,
+): Promise<TaskResponse> {
+  return decideTask(taskId, 'approve', request);
+}
+
+export function rejectTask(
+  taskId: string,
+  request: typeof fetch = fetch,
+): Promise<TaskResponse> {
+  return decideTask(taskId, 'reject', request);
 }

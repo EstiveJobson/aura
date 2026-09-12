@@ -43,6 +43,22 @@ def test_settings_load_the_documented_root_environment_file() -> None:
     assert Settings.model_config["env_file"] == PROJECT_ROOT / ".env"
 
 
+def test_workspace_defaults_to_dedicated_directory() -> None:
+    workspace_default = Settings.model_fields["workspace_root"].default
+
+    assert workspace_default == PROJECT_ROOT / "workspace"
+    assert workspace_default != PROJECT_ROOT / "backend"
+
+
+def test_compose_mounts_only_the_dedicated_workspace() -> None:
+    compose = (PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+
+    assert "WORKSPACE_ROOT: /workspace" in compose
+    assert "./workspace:/workspace" in compose
+    assert "WORKSPACE_ROOT: /app" not in compose
+    assert (PROJECT_ROOT / "workspace" / ".gitignore").is_file()
+
+
 def test_settings_cache_returns_same_instance() -> None:
     get_settings.cache_clear()
 

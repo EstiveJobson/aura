@@ -15,7 +15,17 @@ from app.agents import AgentEngine, GeneratedPlan, LLMPlanner, PlannedStep
 from app.core.config import PlannerBackend, Settings
 from app.database.base import Base
 from app.main import create_app
-from app.models import Execution, ExecutionStatus, Plan, Task, TaskStatus, ToolCall, ToolCallStatus
+from app.models import (
+    Approval,
+    ApprovalDecision,
+    Execution,
+    ExecutionStatus,
+    Plan,
+    Task,
+    TaskStatus,
+    ToolCall,
+    ToolCallStatus,
+)
 from app.providers import ProviderTimeoutError, StructuredGenerationRequest
 from app.services.tasks import PERSISTED_FAILURE_MESSAGE
 from app.tools import (
@@ -24,6 +34,7 @@ from app.tools import (
     ToolExecutor,
     ToolRegistry,
     WorkspaceListTool,
+    WorkspaceMoveTool,
 )
 
 
@@ -72,6 +83,28 @@ class ExplodingToolPlanner:
                     title="Run a registered failing tool",
                     tool_name="exploding_tool",
                     arguments={},
+                ),
+            ),
+        )
+
+
+class MovePlanner:
+    def __init__(self, source: str = "source.txt", destination: str = "moved.txt") -> None:
+        self._source = source
+        self._destination = destination
+
+    def create_plan(self, instruction: str) -> GeneratedPlan:
+        return GeneratedPlan(
+            summary=f'Propose a bounded move for "{instruction}".',
+            steps=(
+                PlannedStep(
+                    sequence=1,
+                    title="Move one workspace file",
+                    tool_name="workspace_move",
+                    arguments={
+                        "source": self._source,
+                        "destination": self._destination,
+                    },
                 ),
             ),
         )
@@ -146,11 +179,21 @@ def build_test_application(
 
 
 async def request(
-    application: FastAPI, method: str, path: str, json: dict[str, str] | None = None
+    application: FastAPI, method: str, path: str, json: dict[str, Any] | None = None
 ) -> Response:
     transport = ASGITransport(app=application)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
         return await client.request(method, path, json=json)
+
+
+def build_move_engine(tmp_path: Path) -> AgentEngine:
+    registry = ToolRegistry()
+    registry.register(WorkspaceMoveTool(tmp_path))
+    return AgentEngine(
+        MovePlanner(),
+        ToolExecutor(registry),
+        planner_name="move-test-planner",
+    )
 
 
 def test_create_task_runs_and_persists_the_complete_vertical_slice(tmp_path: Path) -> None:
@@ -425,6 +468,161 @@ def test_plan_flush_failure_rolls_back_and_marks_existing_task_failed(
     assert getattr(persistence_records[0], "persistence_operation", None) == "prepare_execution"
     assert getattr(persistence_records[0], "failure_state_persisted", None) is True
     assert "password" not in caplog.text
+    engine.dispose()
+
+
+def test_mutating_task_waits_for_persisted_approval_then_executes_once(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "source.txt").write_text("move me", encoding="utf-8")
+    application, session_factory, engine = build_test_application(
+        tmp_path,
+        build_move_engine(tmp_path),
+    )
+
+    created = asyncio.run(
+        request(
+            application,
+            "POST",
+            "/api/tasks",
+            json={"instruction": "Move source.txt to moved.txt."},
+        )
+    )
+
+    assert created.status_code == 201
+    waiting = created.json()
+    assert waiting["status"] == "waiting_for_approval"
+    assert waiting["execution"]["status"] == "waiting_for_approval"
+    assert waiting["execution"]["tool_calls"][0]["status"] == "waiting_for_approval"
+    assert waiting["execution"]["approval"]["decision"] == "pending"
+    assert (tmp_path / "source.txt").exists()
+    assert not (tmp_path / "moved.txt").exists()
+
+    approved = asyncio.run(
+        request(
+            application,
+            "POST",
+            f"/api/tasks/{waiting['id']}/approve",
+            json={"source": "untrusted.txt", "destination": "attacker.txt"},
+        )
+    )
+
+    assert approved.status_code == 200
+    completed = approved.json()
+    assert completed["status"] == "succeeded"
+    assert completed["execution"]["status"] == "succeeded"
+    assert completed["execution"]["approval"]["decision"] == "approved"
+    assert completed["execution"]["approval"]["decided_at"] is not None
+    assert completed["execution"]["tool_calls"][0]["status"] == "succeeded"
+    assert not (tmp_path / "source.txt").exists()
+    assert (tmp_path / "moved.txt").read_text(encoding="utf-8") == "move me"
+    assert not (tmp_path / "attacker.txt").exists()
+
+    duplicate = asyncio.run(request(application, "POST", f"/api/tasks/{waiting['id']}/approve"))
+    assert duplicate.status_code == 409
+    assert duplicate.json() == {
+        "code": "task_state_conflict",
+        "message": "Task is not waiting for approval.",
+    }
+    with session_factory() as session:
+        task = session.scalar(select(Task))
+        execution = session.scalar(select(Execution))
+        tool_call = session.scalar(select(ToolCall))
+        approval = session.scalar(select(Approval))
+        assert task is not None and task.status is TaskStatus.SUCCEEDED
+        assert execution is not None and execution.status is ExecutionStatus.SUCCEEDED
+        assert tool_call is not None and tool_call.status is ToolCallStatus.SUCCEEDED
+        assert approval is not None and approval.decision is ApprovalDecision.APPROVED
+    engine.dispose()
+
+
+def test_reject_persists_terminal_state_without_mutating_workspace(tmp_path: Path) -> None:
+    (tmp_path / "source.txt").write_text("keep me", encoding="utf-8")
+    application, session_factory, engine = build_test_application(
+        tmp_path,
+        build_move_engine(tmp_path),
+    )
+    created = asyncio.run(
+        request(
+            application,
+            "POST",
+            "/api/tasks",
+            json={"instruction": "Move source.txt to moved.txt."},
+        )
+    ).json()
+
+    rejected = asyncio.run(request(application, "POST", f"/api/tasks/{created['id']}/reject"))
+
+    assert rejected.status_code == 200
+    body = rejected.json()
+    assert body["status"] == "rejected"
+    assert body["execution"]["status"] == "rejected"
+    assert body["execution"]["tool_calls"][0]["status"] == "rejected"
+    assert body["execution"]["approval"]["decision"] == "rejected"
+    assert (tmp_path / "source.txt").read_text(encoding="utf-8") == "keep me"
+    assert not (tmp_path / "moved.txt").exists()
+
+    duplicate = asyncio.run(request(application, "POST", f"/api/tasks/{created['id']}/approve"))
+    assert duplicate.status_code == 409
+    with session_factory() as session:
+        assert session.scalar(select(Task)).status is TaskStatus.REJECTED  # type: ignore[union-attr]
+        assert session.scalar(select(Execution)).status is ExecutionStatus.REJECTED  # type: ignore[union-attr]
+        assert session.scalar(select(ToolCall)).status is ToolCallStatus.REJECTED  # type: ignore[union-attr]
+        assert session.scalar(select(Approval)).decision is ApprovalDecision.REJECTED  # type: ignore[union-attr]
+    engine.dispose()
+
+
+def test_approval_revalidates_destination_and_persists_safe_failure(tmp_path: Path) -> None:
+    (tmp_path / "source.txt").write_text("source", encoding="utf-8")
+    application, _, engine = build_test_application(tmp_path, build_move_engine(tmp_path))
+    created = asyncio.run(
+        request(
+            application,
+            "POST",
+            "/api/tasks",
+            json={"instruction": "Move source.txt to moved.txt."},
+        )
+    ).json()
+    (tmp_path / "moved.txt").write_text("new current state", encoding="utf-8")
+
+    response = asyncio.run(request(application, "POST", f"/api/tasks/{created['id']}/approve"))
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["execution"]["approval"]["decision"] == "approved"
+    assert body["error"] == 'Tool "workspace_move" could not be executed safely.'
+    assert (tmp_path / "source.txt").read_text(encoding="utf-8") == "source"
+    assert (tmp_path / "moved.txt").read_text(encoding="utf-8") == "new current state"
+    engine.dispose()
+
+
+def test_approval_endpoints_reject_missing_and_non_waiting_tasks(tmp_path: Path) -> None:
+    application, _, engine = build_test_application(tmp_path)
+    completed = asyncio.run(
+        request(
+            application,
+            "POST",
+            "/api/tasks",
+            json={"instruction": "List this workspace."},
+        )
+    ).json()
+
+    missing = asyncio.run(
+        request(
+            application,
+            "POST",
+            "/api/tasks/efdbf199-3630-484c-8dfb-49b18d0ae32f/approve",
+        )
+    )
+    completed_conflict = asyncio.run(
+        request(application, "POST", f"/api/tasks/{completed['id']}/reject")
+    )
+
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "task_not_found"
+    assert completed_conflict.status_code == 409
+    assert completed_conflict.json()["code"] == "task_state_conflict"
     engine.dispose()
 
 

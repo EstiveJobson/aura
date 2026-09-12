@@ -22,7 +22,14 @@ from app.providers import (
     ProviderUnavailableError,
     StructuredGenerationRequest,
 )
-from app.tools import ToolExecutor, ToolRegistry, WorkspaceListTool
+from app.tools import (
+    ToolExecutor,
+    ToolRegistry,
+    WorkspaceListTool,
+    WorkspaceMoveTool,
+    WorkspaceReadTool,
+    WorkspaceSearchTool,
+)
 
 
 def valid_plan_payload() -> dict[str, Any]:
@@ -119,10 +126,53 @@ def test_llm_planner_accepts_valid_structured_output_and_limits_context(
     assert '"name":"workspace_list"' in request.messages[0].content
     assert str(tmp_path) not in request.messages[0].content
     assert request.output_schema["properties"]["steps"]["maxItems"] == 1
-    assert request.output_schema["properties"]["steps"]["items"]["properties"]["tool_name"][
-        "enum"
-    ] == ["workspace_list"]
+    variants = request.output_schema["properties"]["steps"]["items"]["anyOf"]
+    assert variants[0]["properties"]["tool_name"]["enum"] == ["workspace_list"]
     assert planner.create_plan("List this workspace.").steps[0].arguments == {}
+
+
+def test_llm_planner_receives_multiple_tool_schemas_and_keeps_one_step(
+    tmp_path: Path,
+) -> None:
+    payload = {
+        "summary": "Read the requested workspace file.",
+        "steps": [
+            {
+                "sequence": 1,
+                "title": "Read one file",
+                "tool_name": "workspace_read",
+                "arguments": {"path": "README.md"},
+            }
+        ],
+    }
+    provider = RecordingProvider(payload)
+    registry = ToolRegistry()
+    registry.register(WorkspaceListTool(tmp_path))
+    registry.register(WorkspaceSearchTool(tmp_path))
+    registry.register(WorkspaceReadTool(tmp_path))
+    registry.register(WorkspaceMoveTool(tmp_path))
+    planner = LLMPlanner(provider, registry.definitions())
+    engine = AgentEngine(
+        planner,
+        ToolExecutor(registry),
+        planner_name="multi-tool-planner",
+    )
+
+    plan = engine.create_plan("Read README.md.")
+
+    assert len(plan.steps) == 1
+    assert plan.steps[0].tool_name == "workspace_read"
+    request = provider.requests[0]
+    variants = request.output_schema["properties"]["steps"]["items"]["anyOf"]
+    assert [variant["properties"]["tool_name"]["enum"][0] for variant in variants] == [
+        "workspace_list",
+        "workspace_search",
+        "workspace_read",
+        "workspace_move",
+    ]
+    assert all(
+        definition.name in request.messages[0].content for definition in registry.definitions()
+    )
 
 
 @pytest.mark.parametrize(

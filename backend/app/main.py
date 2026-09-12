@@ -7,12 +7,22 @@ from app.api.routes import router as api_router
 from app.core.config import PlannerBackend, Settings, get_settings
 from app.database.session import create_database_engine, create_session_factory
 from app.providers import OpenAIProvider
-from app.tools import ToolExecutor, ToolRegistry, WorkspaceListTool
+from app.tools import (
+    ToolExecutor,
+    ToolRegistry,
+    WorkspaceListTool,
+    WorkspaceMoveTool,
+    WorkspaceReadTool,
+    WorkspaceSearchTool,
+)
 
 
 def build_agent_engine(settings: Settings) -> AgentEngine:
     registry = ToolRegistry()
     registry.register(WorkspaceListTool(settings.workspace_root))
+    registry.register(WorkspaceSearchTool(settings.workspace_root))
+    registry.register(WorkspaceReadTool(settings.workspace_root))
+    registry.register(WorkspaceMoveTool(settings.workspace_root))
     planner: Planner
     planner_name: str
     if settings.planner_backend is PlannerBackend.MOCK:

@@ -1,23 +1,23 @@
 # Architecture
 
-## Phase 2 boundary
+## Phase 3 boundary
 
-AURA remains a modular monolith with a React frontend, FastAPI backend, and PostgreSQL database. Phase 2 replaces only the planning implementation behind the Phase 1 seam:
+AURA remains a modular monolith with a React frontend, FastAPI backend, and PostgreSQL database. Phase 3 extends the validated Phase 2 seam without changing the planner or provider contracts:
 
-- `frontend/` owns the browser application.
-- `backend/app/api/` owns typed HTTP contracts.
+- `frontend/` owns the browser application and explicit approval controls.
+- `backend/app/api/` owns typed HTTP contracts, including payload-free approve/reject endpoints.
 - `backend/app/core/` owns application configuration.
 - `backend/app/database/` owns SQLAlchemy metadata and session construction.
-- `backend/app/services/` owns task lifecycle transitions and persistence coordination.
-- `backend/app/agents/` owns the validated plan contract, mock and LLM planners, and single-step engine.
+- `backend/app/services/` owns lifecycle transitions, approval decisions, row locking, and persistence coordination.
+- `backend/app/agents/` owns the validated single-step plan and execution boundary.
 - `backend/app/providers/` owns the provider protocol, sanitized failure taxonomy, and OpenAI SDK adapter.
-- `backend/app/tools/` owns the tool contract, registry, executor, and fixed-root read-only workspace listing.
-- `backend/app/models/` owns task, plan, execution, and tool-call records.
-- `backend/alembic/` owns the matching schema migration.
+- `backend/app/tools/` owns tool schemas, the READ/WRITE policy, the registry/executor, and fixed-root workspace operations.
+- `backend/app/models/` owns tasks, plans, executions, tool calls, and approval records.
+- `backend/alembic/` owns the matching schema migrations.
 
 ```mermaid
 flowchart LR
-    Browser[React UI] -->|POST task / GET status| API[FastAPI]
+    Browser[React UI] -->|create / get / approve / reject| API[FastAPI]
     API --> Service[Task Service]
     Service --> Engine[Agent Engine]
     Engine --> Planner[Planner protocol]
@@ -27,19 +27,50 @@ flowchart LR
     Provider --> OpenAI[OpenAI Responses API]
     Engine --> Executor[Tool Executor]
     Executor --> Registry[Tool Registry]
-    Registry --> Tool[workspace_list READ]
+    Registry --> Read[READ: list, search, read]
+    Registry --> Write[WRITE: move]
+    Write --> Gate[Persisted approval gate]
+    Gate -->|approved only| Executor
     Service -->|SQLAlchemy| PostgreSQL[(PostgreSQL)]
     Alembic[Alembic migrations] --> PostgreSQL
 ```
 
-The request remains synchronous because it executes exactly one bounded read-only call. Lifecycle states are still committed at task creation, planning, execution start, and completion so each record is durable. Provider, plan-validation, and tool failures become sanitized persisted operational failures rather than exposing internal payloads or tracebacks.
+The planner still produces exactly one step. Read-only tasks execute synchronously after plan validation. A write task is committed as `waiting_for_approval` with a pending approval record and returns without running the tool. Approve/reject endpoints accept only the task identifier: arguments are reloaded from the stored plan/tool call. PostgreSQL row locking and a durable transition out of the waiting state prevent repeated decisions from executing the same action twice.
 
-## Dependency direction
+## Tool and permission boundary
 
-The API calls the task service; the service coordinates persistence and the agent engine; the engine depends only on planner and tool-executor contracts. `LLMPlanner` depends on `AIProvider`; only the application composition point selects `MockPlanner` or constructs the OpenAI adapter. Provider SDK types and credentials do not cross into the engine, service, tools, API, or frontend.
+Every registered tool declares a name, description, JSON-compatible argument schema, and application-owned permission. `READ` tools may execute automatically. `WRITE` tools are blocked by `ToolExecutor` unless application code passes the approval capability after a persisted approval transition. Planner output cannot set or alter permissions.
 
-The LLM receives the user instruction and the registered `workspace_list` definition: name, description, read permission, and empty argument schema. It does not receive `WORKSPACE_ROOT` or any filesystem handle. The provider requests strict JSON Schema output with one step, then AURA independently validates the plan model, registered tool name, and tool arguments before persistence. The executor never interprets or executes model text.
+The registered Phase 3 tools are:
+
+- `workspace_list`: list top-level names and kinds.
+- `workspace_search`: literal case-insensitive file-name/content search with bounded query length, result count, scanned-file count, input file size, and excerpt size.
+- `workspace_read`: read one UTF-8 text file up to 256 KiB.
+- `workspace_move`: move or rename one regular file into an existing workspace directory without overwriting.
+
+All path-bearing tools accept only normalized workspace-relative paths. Absolute paths and `..` traversal are rejected. Existing paths and destination parents are resolved beneath `WORKSPACE_ROOT`; symlink components and resolved escapes are rejected. The same validation runs during planning and again immediately before execution. Binary, unsupported, oversized, missing, and unreadable inputs become sanitized tool failures.
+
+There is no shell, delete operation, arbitrary command execution, user-controlled workspace root, multi-step planning, or autonomous loop.
+
+## Provider boundary
+
+`LLMPlanner` receives the registered tool definitions but never receives `WORKSPACE_ROOT` or a filesystem handle. Its strict structured-output schema allows exactly one step and uses a tool-specific argument branch for every registered tool. AURA independently validates the returned plan model, registered name, and selected argument schema before persistence. `MockPlanner` remains deterministic and provider-free for normal CI.
+
+## Approval lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> planning
+    planning --> executing: validated READ
+    planning --> waiting_for_approval: validated WRITE
+    waiting_for_approval --> executing: approve stored execution
+    waiting_for_approval --> rejected: reject stored execution
+    executing --> succeeded: tool result persisted
+    executing --> failed: sanitized failure persisted
+```
+
+Approval changes are terminal once the execution leaves `waiting_for_approval`. Completed, executing, failed, and rejected tasks return a conflict for further decisions. Approval is persisted before a write runs; the final tool, execution, and task outcome is committed afterward.
 
 ## Phase boundary
 
-This phase exposes only task creation and task retrieval. It registers exactly one tool and does not accept a path from the planner or user; `WORKSPACE_ROOT` is the execution boundary. Additional tools, approval workflows, authentication, memory, multiple agents, streaming, autonomous loops, destructive actions, and advanced observability remain out of scope until their roadmap phases.
+Phase 3 intentionally stops at one planned invocation. Authentication, memory, multiple agents, queues, streaming, web browsing, advanced observability, deletion, shell access, and Phase 4 behavior remain out of scope.
