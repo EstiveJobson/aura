@@ -1,5 +1,7 @@
+import { act } from 'react';
+import { createRoot } from 'react-dom/client';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { App, TaskResult } from '../src/App';
 import { createTask } from '../src/api';
@@ -69,6 +71,42 @@ const completedTask: TaskResponse = {
   },
 };
 
+const failedPlanningTask: TaskResponse = {
+  ...completedTask,
+  status: 'failed',
+  result: null,
+  error: 'The deterministic planner could not create a plan.',
+  plan: null,
+  execution: null,
+};
+
+const failedToolTask: TaskResponse = {
+  ...completedTask,
+  status: 'failed',
+  result: null,
+  error: 'Tool "workspace_list" could not be executed safely.',
+  execution: {
+    ...completedTask.execution!,
+    status: 'failed',
+    result: null,
+    error: 'Tool "workspace_list" could not be executed safely.',
+    tool_calls: [
+      {
+        ...completedTask.execution!.tool_calls[0],
+        status: 'failed',
+        result: null,
+        error: 'Tool "workspace_list" could not be executed safely.',
+      },
+    ],
+  },
+};
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+  document.body.replaceChildren();
+});
+
 describe('App', () => {
   it('renders the Phase 1 task form and read-only boundary', () => {
     const markup = renderToStaticMarkup(<App />);
@@ -83,8 +121,28 @@ describe('App', () => {
 
     expect(markup).toContain('Task completed');
     expect(markup).toContain('Plan created');
+    expect(markup).toContain('Read-only tool completed');
     expect(markup).toContain('workspace_list');
     expect(markup).toContain('README.md');
+  });
+
+  it('renders failed planning without claiming plan or tool completion', () => {
+    const markup = renderToStaticMarkup(
+      <TaskResult task={failedPlanningTask} />,
+    );
+
+    expect(markup).toContain('Planning failed');
+    expect(markup).toContain('Tool not started');
+    expect(markup).not.toContain('Plan created');
+    expect(markup).not.toContain('Read-only tool completed');
+  });
+
+  it('renders a persisted plan and failed tool without claiming tool completion', () => {
+    const markup = renderToStaticMarkup(<TaskResult task={failedToolTask} />);
+
+    expect(markup).toContain('Plan created');
+    expect(markup).toContain('Tool failed');
+    expect(markup).not.toContain('Read-only tool completed');
   });
 
   it('models submitting, completed, and request failure UI states', () => {
@@ -123,5 +181,35 @@ describe('App', () => {
         body: JSON.stringify({ instruction: 'List this workspace.' }),
       }),
     );
+  });
+
+  it('submits through the component and renders the persisted response', async () => {
+    const request = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(completedTask), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', request);
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    const container = document.createElement('div');
+    document.body.append(container);
+    const root = createRoot(container);
+
+    await act(async () => root.render(<App />));
+    const form = container.querySelector('form');
+    expect(form).not.toBeNull();
+
+    await act(async () => {
+      form!.dispatchEvent(
+        new Event('submit', { bubbles: true, cancelable: true }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(request).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain('Task completed');
+    expect(container.textContent).toContain('README.md');
+    await act(async () => root.unmount());
   });
 });

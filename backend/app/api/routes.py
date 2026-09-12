@@ -7,6 +7,7 @@ from starlette.responses import JSONResponse
 
 from app.api.dependencies import TaskServiceDependency
 from app.api.schemas import ErrorResponse, TaskCreate, TaskResponse
+from app.services import TaskPersistenceError
 
 router = APIRouter()
 
@@ -34,21 +35,39 @@ def health() -> HealthResponse:
     status_code=status.HTTP_201_CREATED,
     tags=["tasks"],
     summary="Create and execute a deterministic task",
+    responses={status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ErrorResponse}},
 )
-def create_task(payload: TaskCreate, service: TaskServiceDependency) -> TaskResponse:
-    task = service.create_and_execute(payload.instruction)
+def create_task(payload: TaskCreate, service: TaskServiceDependency) -> TaskResponse | JSONResponse:
+    try:
+        task = service.create_and_execute(payload.instruction)
+    except TaskPersistenceError as exc:
+        error = ErrorResponse(code=exc.code, message=exc.message)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=error.model_dump(),
+        )
     return TaskResponse.model_validate(task)
 
 
 @router.get(
     "/tasks/{task_id}",
     response_model=TaskResponse,
-    responses={status.HTTP_404_NOT_FOUND: {"model": ErrorResponse}},
+    responses={
+        status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
+        status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ErrorResponse},
+    },
     tags=["tasks"],
     summary="Get persisted task execution status",
 )
 def get_task(task_id: UUID, service: TaskServiceDependency) -> TaskResponse | JSONResponse:
-    task = service.get(task_id)
+    try:
+        task = service.get(task_id)
+    except TaskPersistenceError as exc:
+        error = ErrorResponse(code=exc.code, message=exc.message)
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=error.model_dump(),
+        )
     if task is None:
         error = ErrorResponse(code="task_not_found", message="Task was not found.")
         return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content=error.model_dump())

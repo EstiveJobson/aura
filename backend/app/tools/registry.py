@@ -31,6 +31,9 @@ class ToolExecutor:
     def __init__(self, registry: ToolRegistry) -> None:
         self._registry = registry
 
+    def validate_tool(self, name: str) -> None:
+        self._registry.get(name)
+
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         tool = self._registry.get(name)
         try:

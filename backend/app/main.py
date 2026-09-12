@@ -12,7 +12,11 @@ from app.tools import ToolExecutor, ToolRegistry, WorkspaceListTool
 def build_agent_engine(settings: Settings) -> AgentEngine:
     registry = ToolRegistry()
     registry.register(WorkspaceListTool(settings.workspace_root))
-    return AgentEngine(MockPlanner(), ToolExecutor(registry))
+    return AgentEngine(
+        MockPlanner(),
+        ToolExecutor(registry),
+        planner_name="mock-planner-v1",
+    )
 
 
 def create_app(

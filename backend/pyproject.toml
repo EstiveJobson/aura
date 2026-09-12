@@ -24,3 +24,6 @@ addopts = [
     "--cov-report=xml",
     "--cov-fail-under=80",
 ]
+markers = [
+    "postgres: integration tests that require a migrated PostgreSQL database",
+]
