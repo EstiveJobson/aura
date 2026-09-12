@@ -160,16 +160,16 @@ export function App() {
           <span className="brand-mark">A</span>
           <span>AURA</span>
         </a>
-        <span className="phase-badge">Phase 1 · deterministic</span>
+        <span className="phase-badge">Phase 2 · provider-ready</span>
       </header>
 
       <main>
         <section className="task-intro" aria-labelledby="task-title">
           <div className="intro-copy">
-            <p className="eyebrow">First agent workflow</p>
+            <p className="eyebrow">Bounded agent workflow</p>
             <h1 id="task-title">Inspect the workspace safely.</h1>
             <p className="summary">
-              Create one task. A deterministic planner will select AURA&apos;s
+              Create one task. The configured planner will select AURA&apos;s
               registered read-only tool, persist the execution, and return the
               result.
             </p>

@@ -84,5 +84,7 @@ def test_registry_rejects_duplicate_and_unknown_tools(tmp_path: Path) -> None:
         registry.register(tool)
     with pytest.raises(ToolError, match="not registered"):
         ToolExecutor(registry).execute("missing", {})
+    with pytest.raises(ToolError, match="received invalid arguments"):
+        ToolExecutor(registry).validate_call("workspace_list", {"path": "../outside"})
     with pytest.raises(ToolError, match="could not be executed safely"):
         ToolExecutor(registry).execute("workspace_list", {"unexpected": True})

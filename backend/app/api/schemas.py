@@ -4,13 +4,14 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.core.constraints import TASK_INSTRUCTION_MAX_LENGTH
 from app.models import ExecutionStatus, TaskStatus, ToolCallStatus
 
 
 class TaskCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    instruction: str = Field(min_length=1, max_length=2_000)
+    instruction: str = Field(min_length=1, max_length=TASK_INSTRUCTION_MAX_LENGTH)
 
     @field_validator("instruction")
     @classmethod
