@@ -21,7 +21,7 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-aura}:${POSTGRES_PASSWORD:-aura}@db:5432/${POSTGRES_DB:-aura}
       CORS_ORIGINS: '["http://localhost:5173"]'
-      WORKSPACE_ROOT: /app
+      WORKSPACE_ROOT: /workspace
       PLANNER_BACKEND: ${PLANNER_BACKEND:-mock}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
@@ -32,6 +32,8 @@ services:
         condition: service_healthy
     ports:
       - "127.0.0.1:8000:8000"
+    volumes:
+      - ./workspace:/workspace
 
   frontend:
     build:

@@ -1,4 +1,6 @@
 from app.models.execution import (
+    Approval,
+    ApprovalDecision,
     Execution,
     ExecutionStatus,
     Plan,
@@ -9,6 +11,8 @@ from app.models.execution import (
 )
 
 __all__ = [
+    "Approval",
+    "ApprovalDecision",
     "Execution",
     "ExecutionStatus",
     "Plan",

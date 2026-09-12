@@ -1,13 +1,18 @@
 import logging
+from typing import Any
 from uuid import UUID, uuid4
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
 from app.agents.engine import AgentEngine, AgentExecutionError
+from app.agents.planner import ExecutionPlan
 from app.models import (
+    Approval,
+    ApprovalDecision,
     Execution,
     ExecutionStatus,
     Plan,
@@ -22,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 PERSISTENCE_FAILURE_MESSAGE = "The task could not be persisted because storage is unavailable."
 PERSISTED_FAILURE_MESSAGE = "Task execution failed because its state could not be persisted."
+TASK_NOT_FOUND_MESSAGE = "Task was not found."
+TASK_STATE_CONFLICT_MESSAGE = "Task is not waiting for approval."
 
 
 class TaskPersistenceError(RuntimeError):
@@ -32,6 +39,22 @@ class TaskPersistenceError(RuntimeError):
     def __init__(self) -> None:
         super().__init__(PERSISTENCE_FAILURE_MESSAGE)
         self.message = PERSISTENCE_FAILURE_MESSAGE
+
+
+class TaskNotFoundError(RuntimeError):
+    code = "task_not_found"
+
+    def __init__(self) -> None:
+        super().__init__(TASK_NOT_FOUND_MESSAGE)
+        self.message = TASK_NOT_FOUND_MESSAGE
+
+
+class TaskStateConflictError(RuntimeError):
+    code = "task_state_conflict"
+
+    def __init__(self) -> None:
+        super().__init__(TASK_STATE_CONFLICT_MESSAGE)
+        self.message = TASK_STATE_CONFLICT_MESSAGE
 
 
 class TaskService:
@@ -58,7 +81,16 @@ class TaskService:
                 summary=plan.summary,
                 steps=[step.model_dump(mode="json") for step in plan.steps],
             )
-            execution = Execution(task=task, status=ExecutionStatus.RUNNING)
+            requires_approval = self._agent_engine.requires_approval(plan)
+            execution_status = (
+                ExecutionStatus.WAITING_FOR_APPROVAL
+                if requires_approval
+                else ExecutionStatus.RUNNING
+            )
+            tool_call_status = (
+                ToolCallStatus.WAITING_FOR_APPROVAL if requires_approval else ToolCallStatus.RUNNING
+            )
+            execution = Execution(task=task, status=execution_status)
             self._session.add_all((plan_record, execution))
             self._flush_or_raise("prepare_execution", task, execution)
 
@@ -68,27 +100,92 @@ class TaskService:
                 plan_id=plan_record.id,
                 tool_name=step.tool_name,
                 arguments=step.arguments,
-                status=ToolCallStatus.RUNNING,
+                status=tool_call_status,
             )
-            task.status = TaskStatus.EXECUTING
             self._session.add(tool_call)
-            self._commit_or_raise("start_execution", task, execution, tool_call)
+            if requires_approval:
+                task.status = TaskStatus.WAITING_FOR_APPROVAL
+                self._session.add(
+                    Approval(
+                        execution=execution,
+                        decision=ApprovalDecision.PENDING,
+                    )
+                )
+                self._commit_or_raise("await_approval", task, execution, tool_call)
+            else:
+                task.status = TaskStatus.EXECUTING
+                self._commit_or_raise("start_execution", task, execution, tool_call)
 
-            outcome = self._agent_engine.execute(plan)
-            completed_at = utc_now()
-            tool_call.status = ToolCallStatus.SUCCEEDED
-            tool_call.result = outcome.output
-            tool_call.completed_at = completed_at
-            execution.status = ExecutionStatus.SUCCEEDED
-            execution.result = outcome.output
-            execution.completed_at = completed_at
-            task.status = TaskStatus.SUCCEEDED
-            task.result = outcome.final_result
-            self._commit_or_raise("complete_execution", task, execution, tool_call)
+                outcome = self._agent_engine.execute(plan)
+                self._complete_execution(
+                    task,
+                    execution,
+                    tool_call,
+                    outcome.output,
+                    outcome.final_result,
+                )
         except AgentExecutionError as exc:
             self._log_execution_failure(exc, task, execution, tool_call)
             self._mark_execution_failed(task, execution, tool_call, str(exc))
 
+        return self._reload_created_task(task, execution, tool_call)
+
+    def approve(self, task_id: UUID) -> Task:
+        task = self._get_for_decision(task_id)
+        execution, tool_call, approval = self._require_waiting_for_approval(task)
+        plan = self._execution_plan(task)
+        step = plan.steps[0]
+        if tool_call.tool_name != step.tool_name or tool_call.arguments != step.arguments:
+            raise TaskStateConflictError
+
+        decided_at = utc_now()
+        approval.decision = ApprovalDecision.APPROVED
+        approval.decided_at = decided_at
+        task.status = TaskStatus.EXECUTING
+        execution.status = ExecutionStatus.RUNNING
+        tool_call.status = ToolCallStatus.RUNNING
+        self._commit_or_raise("approve_execution", task, execution, tool_call)
+
+        try:
+            outcome = self._agent_engine.execute(plan, approved=True)
+            self._complete_execution(
+                task,
+                execution,
+                tool_call,
+                outcome.output,
+                outcome.final_result,
+            )
+        except AgentExecutionError as exc:
+            self._log_execution_failure(exc, task, execution, tool_call)
+            self._mark_execution_failed(task, execution, tool_call, str(exc))
+        return self._reload_created_task(task, execution, tool_call)
+
+    def reject(self, task_id: UUID) -> Task:
+        task = self._get_for_decision(task_id)
+        execution, tool_call, approval = self._require_waiting_for_approval(task)
+        completed_at = utc_now()
+        approval.decision = ApprovalDecision.REJECTED
+        approval.decided_at = completed_at
+        task.status = TaskStatus.REJECTED
+        task.result = None
+        task.error = None
+        execution.status = ExecutionStatus.REJECTED
+        execution.result = None
+        execution.error = None
+        execution.completed_at = completed_at
+        tool_call.status = ToolCallStatus.REJECTED
+        tool_call.result = None
+        tool_call.error = None
+        tool_call.completed_at = completed_at
+        self._commit_or_raise("reject_execution", task, execution, tool_call)
+        return self._reload_created_task(task, execution, tool_call)
+
+    def _reload_created_task(
+        self,
+        task: Task,
+        execution: Execution | None,
+        tool_call: ToolCall | None,
+    ) -> Task:
         persisted_task = self.get(task.id)
         if persisted_task is None:
             logger.error(
@@ -114,6 +211,7 @@ class TaskService:
             .options(
                 selectinload(Task.plan),
                 selectinload(Task.execution).selectinload(Execution.tool_calls),
+                selectinload(Task.execution).selectinload(Execution.approval),
             )
         )
         try:
@@ -136,6 +234,95 @@ class TaskService:
             )
             raise TaskPersistenceError from exc
 
+    def _get_for_decision(self, task_id: UUID) -> Task:
+        statement = (
+            select(Task)
+            .where(Task.id == task_id)
+            .options(
+                selectinload(Task.plan),
+                selectinload(Task.execution).selectinload(Execution.tool_calls),
+                selectinload(Task.execution).selectinload(Execution.approval),
+            )
+            .with_for_update()
+        )
+        try:
+            task = self._session.scalar(statement)
+        except SQLAlchemyError as exc:
+            rollback_succeeded = self._rollback()
+            logger.error(
+                "approval state read failed task_id=%s error_type=%s",
+                task_id,
+                type(exc).__name__,
+                extra={
+                    "task_id": str(task_id),
+                    "execution_id": None,
+                    "tool_call_id": None,
+                    "persistence_operation": "read_approval_state",
+                    "database_error_type": type(exc).__name__,
+                    "rollback_succeeded": rollback_succeeded,
+                    "failure_state_persisted": False,
+                },
+            )
+            raise TaskPersistenceError from exc
+        if task is None:
+            raise TaskNotFoundError
+        return task
+
+    @staticmethod
+    def _require_waiting_for_approval(
+        task: Task,
+    ) -> tuple[Execution, ToolCall, Approval]:
+        execution = task.execution
+        if (
+            task.status is not TaskStatus.WAITING_FOR_APPROVAL
+            or task.plan is None
+            or execution is None
+            or execution.status is not ExecutionStatus.WAITING_FOR_APPROVAL
+            or execution.approval is None
+            or execution.approval.decision is not ApprovalDecision.PENDING
+            or len(execution.tool_calls) != 1
+            or execution.tool_calls[0].status is not ToolCallStatus.WAITING_FOR_APPROVAL
+        ):
+            raise TaskStateConflictError
+        return execution, execution.tool_calls[0], execution.approval
+
+    @staticmethod
+    def _execution_plan(task: Task) -> ExecutionPlan:
+        if task.plan is None:
+            raise TaskStateConflictError
+        try:
+            return ExecutionPlan.model_validate(
+                {
+                    "planner": task.plan.planner,
+                    "summary": task.plan.summary,
+                    "steps": task.plan.steps,
+                }
+            )
+        except ValidationError as exc:
+            raise TaskStateConflictError from exc
+
+    def _complete_execution(
+        self,
+        task: Task,
+        execution: Execution,
+        tool_call: ToolCall,
+        output: dict[str, Any],
+        final_result: str,
+    ) -> None:
+        completed_at = utc_now()
+        tool_call.status = ToolCallStatus.SUCCEEDED
+        tool_call.result = output
+        tool_call.error = None
+        tool_call.completed_at = completed_at
+        execution.status = ExecutionStatus.SUCCEEDED
+        execution.result = output
+        execution.error = None
+        execution.completed_at = completed_at
+        task.status = TaskStatus.SUCCEEDED
+        task.result = final_result
+        task.error = None
+        self._commit_or_raise("complete_execution", task, execution, tool_call)
+
     def _mark_execution_failed(
         self,
         task: Task,
@@ -146,13 +333,16 @@ class TaskService:
         completed_at = utc_now()
         if tool_call is not None:
             tool_call.status = ToolCallStatus.FAILED
+            tool_call.result = None
             tool_call.error = error
             tool_call.completed_at = completed_at
         if execution is not None:
             execution.status = ExecutionStatus.FAILED
+            execution.result = None
             execution.error = error
             execution.completed_at = completed_at
         task.status = TaskStatus.FAILED
+        task.result = None
         task.error = error
         self._commit_or_raise("record_execution_failure", task, execution, tool_call)
 
@@ -163,10 +353,19 @@ class TaskService:
         execution: Execution | None = None,
         tool_call: ToolCall | None = None,
     ) -> None:
+        task_id = task.id
+        execution_id = execution.id if execution is not None else None
+        tool_call_id = tool_call.id if tool_call is not None else None
         try:
             self._session.commit()
         except SQLAlchemyError as exc:
-            self._handle_write_failure(operation, exc, task, execution, tool_call)
+            self._handle_write_failure(
+                operation,
+                exc,
+                task_id,
+                execution_id,
+                tool_call_id,
+            )
 
     def _flush_or_raise(
         self,
@@ -175,22 +374,28 @@ class TaskService:
         execution: Execution | None = None,
         tool_call: ToolCall | None = None,
     ) -> None:
+        task_id = task.id
+        execution_id = execution.id if execution is not None else None
+        tool_call_id = tool_call.id if tool_call is not None else None
         try:
             self._session.flush()
         except SQLAlchemyError as exc:
-            self._handle_write_failure(operation, exc, task, execution, tool_call)
+            self._handle_write_failure(
+                operation,
+                exc,
+                task_id,
+                execution_id,
+                tool_call_id,
+            )
 
     def _handle_write_failure(
         self,
         operation: str,
         error: SQLAlchemyError,
-        task: Task,
-        execution: Execution | None,
-        tool_call: ToolCall | None,
+        task_id: UUID,
+        execution_id: UUID | None,
+        tool_call_id: UUID | None,
     ) -> None:
-        task_id = task.id
-        execution_id = execution.id if execution is not None else None
-        tool_call_id = tool_call.id if tool_call is not None else None
         bind = self._session.get_bind()
         rollback_succeeded = self._rollback()
         failure_state_persisted = False

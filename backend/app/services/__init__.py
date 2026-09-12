@@ -1,5 +1,15 @@
-"""Application services will be introduced with the Phase 1 vertical slice."""
+"""Task lifecycle and approval coordination services."""
 
-from app.services.tasks import TaskPersistenceError, TaskService
+from app.services.tasks import (
+    TaskNotFoundError,
+    TaskPersistenceError,
+    TaskService,
+    TaskStateConflictError,
+)
 
-__all__ = ["TaskPersistenceError", "TaskService"]
+__all__ = [
+    "TaskNotFoundError",
+    "TaskPersistenceError",
+    "TaskService",
+    "TaskStateConflictError",
+]

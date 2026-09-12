@@ -1,10 +1,14 @@
 from typing import Any
 
-from app.tools.base import Tool, ToolDefinition
+from app.tools.base import PermissionLevel, Tool, ToolDefinition
 
 
 class ToolError(RuntimeError):
     """Base error for safe tool lookup, validation, and execution failures."""
+
+
+class ToolApprovalRequired(ToolError):
+    """Raised when application policy blocks an unapproved mutation."""
 
 
 class ToolRegistry:
@@ -34,6 +38,12 @@ class ToolExecutor:
     def validate_tool(self, name: str) -> None:
         self._registry.get(name)
 
+    def permission_for(self, name: str) -> PermissionLevel:
+        return self._registry.get(name).definition.permission
+
+    def requires_approval(self, name: str) -> bool:
+        return self.permission_for(name) is PermissionLevel.WRITE
+
     def validate_call(self, name: str, arguments: dict[str, Any]) -> None:
         tool = self._registry.get(name)
         try:
@@ -41,9 +51,18 @@ class ToolExecutor:
         except Exception as exc:
             raise ToolError(f'Tool "{name}" received invalid arguments.') from exc
 
-    def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    def execute(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        approved: bool = False,
+    ) -> dict[str, Any]:
         tool = self._registry.get(name)
+        if tool.definition.permission is PermissionLevel.WRITE and not approved:
+            raise ToolApprovalRequired(f'Tool "{name}" requires explicit approval.')
         try:
+            self.validate_call(name, arguments)
             return tool.execute(arguments)
         except Exception as exc:
             raise ToolError(f'Tool "{name}" could not be executed safely.') from exc

@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     api_prefix: str = "/api"
     database_url: str = "postgresql+psycopg://aura:aura@localhost:5432/aura"
     cors_origins: list[str] = ["http://localhost:5173"]
-    workspace_root: Path = Path(".")
+    workspace_root: Path = PROJECT_ROOT / "workspace"
     planner_backend: PlannerBackend = PlannerBackend.MOCK
     openai_api_key: SecretStr | None = None
     openai_model: str = Field(default="gpt-5-mini", min_length=1, max_length=40)

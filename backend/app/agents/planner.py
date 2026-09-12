@@ -41,7 +41,7 @@ class Planner(Protocol):
 
 
 class MockPlanner:
-    """The deterministic Phase 1 planner; it always selects the sole registered tool."""
+    """The deterministic planner used for tests and local development."""
 
     def create_plan(self, instruction: str) -> GeneratedPlan:
         prefix = 'Inspect the configured workspace for "'
@@ -68,13 +68,13 @@ class LLMPlanner:
         provider: AIProvider,
         tool_definitions: tuple[ToolDefinition, ...],
     ) -> None:
-        if len(tool_definitions) != 1:
-            raise ValueError("The Phase 2 planner requires exactly one registered tool.")
+        if not tool_definitions:
+            raise ValueError("The planner requires at least one registered tool.")
         self._provider = provider
         self._tool_definitions = tuple(
             ToolDefinition.model_validate(definition) for definition in tool_definitions
         )
-        self._output_schema = self._build_output_schema(self._tool_definitions[0])
+        self._output_schema = self._build_output_schema(self._tool_definitions)
 
     def create_plan(self, instruction: str) -> GeneratedPlan:
         normalized_instruction = instruction.strip()
@@ -103,7 +103,25 @@ class LLMPlanner:
         return GeneratedPlan.model_validate(payload)
 
     @staticmethod
-    def _build_output_schema(tool: ToolDefinition) -> dict[str, Any]:
+    def _build_output_schema(tools: tuple[ToolDefinition, ...]) -> dict[str, Any]:
+        step_variants = [
+            {
+                "type": "object",
+                "properties": {
+                    "sequence": {"type": "integer", "enum": [1]},
+                    "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": PLAN_STEP_TITLE_MAX_LENGTH,
+                    },
+                    "tool_name": {"type": "string", "enum": [tool.name]},
+                    "arguments": deepcopy(tool.parameters),
+                },
+                "required": ["sequence", "title", "tool_name", "arguments"],
+                "additionalProperties": False,
+            }
+            for tool in tools
+        ]
         return {
             "type": "object",
             "properties": {
@@ -116,21 +134,7 @@ class LLMPlanner:
                     "type": "array",
                     "minItems": 1,
                     "maxItems": 1,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "sequence": {"type": "integer", "enum": [1]},
-                            "title": {
-                                "type": "string",
-                                "minLength": 1,
-                                "maxLength": PLAN_STEP_TITLE_MAX_LENGTH,
-                            },
-                            "tool_name": {"type": "string", "enum": [tool.name]},
-                            "arguments": deepcopy(tool.parameters),
-                        },
-                        "required": ["sequence", "title", "tool_name", "arguments"],
-                        "additionalProperties": False,
-                    },
+                    "items": {"anyOf": step_variants},
                 },
             },
             "required": ["summary", "steps"],

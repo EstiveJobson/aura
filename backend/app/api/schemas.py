@@ -5,7 +5,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.core.constraints import TASK_INSTRUCTION_MAX_LENGTH
-from app.models import ExecutionStatus, TaskStatus, ToolCallStatus
+from app.models import ApprovalDecision, ExecutionStatus, TaskStatus, ToolCallStatus
 
 
 class TaskCreate(BaseModel):
@@ -54,6 +54,15 @@ class ToolCallResponse(BaseModel):
     completed_at: datetime | None
 
 
+class ApprovalResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    decision: ApprovalDecision
+    requested_at: datetime
+    decided_at: datetime | None
+
+
 class ExecutionResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -64,6 +73,7 @@ class ExecutionResponse(BaseModel):
     started_at: datetime
     completed_at: datetime | None
     tool_calls: list[ToolCallResponse]
+    approval: ApprovalResponse | None
 
 
 class TaskResponse(BaseModel):

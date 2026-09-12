@@ -71,10 +71,29 @@ class AgentEngine:
             steps=validated.steps,
         )
 
-    def execute(self, plan: ExecutionPlan) -> AgentExecutionResult:
+    def requires_approval(self, plan: ExecutionPlan) -> bool:
         step = plan.steps[0]
         try:
-            output = self._tool_executor.execute(step.tool_name, step.arguments)
+            return self._tool_executor.requires_approval(step.tool_name)
+        except ToolError as exc:
+            raise AgentExecutionError(
+                "The generated plan was rejected.",
+                stage="plan_validation",
+            ) from exc
+
+    def execute(
+        self,
+        plan: ExecutionPlan,
+        *,
+        approved: bool = False,
+    ) -> AgentExecutionResult:
+        step = plan.steps[0]
+        try:
+            output = self._tool_executor.execute(
+                step.tool_name,
+                step.arguments,
+                approved=approved,
+            )
         except ToolError as exc:
             raise AgentExecutionError(str(exc), stage="tool") from exc
 

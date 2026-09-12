@@ -15,4 +15,10 @@ def test_database_foundation_builds_a_working_session() -> None:
     finally:
         engine.dispose()
 
-    assert set(Base.metadata.tables) == {"tasks", "plans", "executions", "tool_calls"}
+    assert set(Base.metadata.tables) == {
+        "tasks",
+        "plans",
+        "executions",
+        "tool_calls",
+        "approvals",
+    }

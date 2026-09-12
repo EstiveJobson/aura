@@ -19,21 +19,33 @@ def utc_now() -> datetime:
 class TaskStatus(StrEnum):
     PENDING = "pending"
     PLANNING = "planning"
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
     EXECUTING = "executing"
     SUCCEEDED = "succeeded"
+    REJECTED = "rejected"
     FAILED = "failed"
 
 
 class ExecutionStatus(StrEnum):
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
+    REJECTED = "rejected"
     FAILED = "failed"
 
 
 class ToolCallStatus(StrEnum):
+    WAITING_FOR_APPROVAL = "waiting_for_approval"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
+    REJECTED = "rejected"
     FAILED = "failed"
+
+
+class ApprovalDecision(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
 
 
 class Task(Base):
@@ -97,6 +109,9 @@ class Execution(Base):
     tool_calls: Mapped[list[ToolCall]] = relationship(
         back_populates="execution", cascade="all, delete-orphan", order_by="ToolCall.started_at"
     )
+    approval: Mapped[Approval | None] = relationship(
+        back_populates="execution", cascade="all, delete-orphan", uselist=False
+    )
 
 
 class ToolCall(Base):
@@ -124,3 +139,25 @@ class ToolCall(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     execution: Mapped[Execution] = relationship(back_populates="tool_calls")
+
+
+class Approval(Base):
+    __tablename__ = "approvals"
+
+    id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
+    execution_id: Mapped[UUID] = mapped_column(
+        ForeignKey("executions.id", ondelete="CASCADE"), unique=True
+    )
+    decision: Mapped[ApprovalDecision] = mapped_column(
+        Enum(
+            ApprovalDecision,
+            name="approval_decision",
+            native_enum=False,
+            create_constraint=True,
+        ),
+        default=ApprovalDecision.PENDING,
+    )
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    execution: Mapped[Execution] = relationship(back_populates="approval")
