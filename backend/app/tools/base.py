@@ -1,5 +1,5 @@
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -27,3 +27,17 @@ class Tool(Protocol):
     def validate_arguments(self, arguments: dict[str, Any]) -> None: ...
 
     def execute(self, arguments: dict[str, Any]) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class ApprovalBoundTool(Protocol):
+    """Internal contract for WRITE tools with application-owned preconditions."""
+
+    def capture_approval_context(self, arguments: dict[str, Any]) -> dict[str, Any]: ...
+
+    def execute(
+        self,
+        arguments: dict[str, Any],
+        *,
+        approval_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]: ...

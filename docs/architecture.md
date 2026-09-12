@@ -48,7 +48,11 @@ The registered Phase 3 tools are:
 - `workspace_read`: read one UTF-8 text file up to 256 KiB.
 - `workspace_move`: move or rename one regular file into an existing workspace directory without overwriting.
 
-All path-bearing tools accept only normalized workspace-relative paths. Absolute paths and `..` traversal are rejected. Existing paths and destination parents are resolved beneath `WORKSPACE_ROOT`; symlink components and resolved escapes are rejected. The same validation runs during planning and again immediately before execution. Binary, unsupported, oversized, missing, and unreadable inputs become sanitized tool failures.
+All path-bearing tools accept only normalized workspace-relative paths. Absolute paths and `..` traversal are rejected. On native Windows, device names, alternate streams, trailing-dot/space aliases, and reparse points are also rejected without imposing Windows filename rules inside Linux containers.
+
+Filesystem access is acquired through one internal platform boundary rather than validating a pathname and opening it later. Linux uses a held workspace descriptor plus `openat2` beneath/no-symlink resolution; Windows holds non-delete-shared handles for each verified non-reparse component. Opened objects are type-checked, reads reject non-regular files, and platforms without the required guarantees fail closed. `workspace_list` and `workspace_search` cap visited entries, visited directories, depth, traversal work, returned items/bytes, and search input bytes without first materializing an unbounded directory.
+
+Moves use an atomic primitive with replacement disabled: descriptor-relative `renameat2(RENAME_NOREPLACE)` on Linux and source-handle `FileRenameInfo` on Windows while the verified destination chain is locked. There is no link/unlink rollback and no overwrite fallback.
 
 There is no shell, delete operation, arbitrary command execution, user-controlled workspace root, multi-step planning, or autonomous loop.
 
@@ -69,7 +73,7 @@ stateDiagram-v2
     executing --> failed: sanitized failure persisted
 ```
 
-Approval changes are terminal once the execution leaves `waiting_for_approval`. Completed, executing, failed, and rejected tasks return a conflict for further decisions. Approval is persisted before a write runs; the final tool, execution, and task outcome is committed afterward.
+Approval changes are terminal once the execution leaves `waiting_for_approval`. Completed, executing, failed, and rejected tasks return a conflict for further decisions. When a WRITE task begins waiting, AURA stores an application-generated workspace identity and source-file precondition on the approval record; this internal metadata is not part of planner or API input. Approval is persisted before a write runs. Execution reacquires the source and rejects changed workspace/source state as a terminal safe failure, so a fresh task is required. The final tool, execution, and task outcome is committed afterward.
 
 ## Phase boundary
 

@@ -4,6 +4,14 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from app.tools.base import PermissionLevel, ToolDefinition
+from app.tools.workspace_paths import WorkspaceBoundary, serialized_item_size
+
+MAX_LIST_VISITED_ENTRIES = 2_048
+MAX_LIST_VISITED_DIRECTORIES = 1
+MAX_LIST_DEPTH = 0
+MAX_LIST_RESULTS = 1_000
+MAX_LIST_RETURN_BYTES = 64 * 1024
+MAX_LIST_TRAVERSAL_WORK = MAX_LIST_VISITED_ENTRIES + MAX_LIST_VISITED_DIRECTORIES
 
 
 class WorkspaceListArguments(BaseModel):
@@ -14,7 +22,7 @@ class WorkspaceListTool:
     """List immediate entries inside one preconfigured workspace without mutating it."""
 
     def __init__(self, workspace_root: Path) -> None:
-        self._workspace_root = workspace_root.resolve(strict=True)
+        self._boundary = WorkspaceBoundary(workspace_root)
 
     @property
     def definition(self) -> ToolDefinition:
@@ -29,19 +37,39 @@ class WorkspaceListTool:
 
     def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         self.validate_arguments(arguments)
-        entries = [
-            {"name": entry.name, "kind": "directory" if entry.is_dir() else "file"}
-            for entry in sorted(
-                self._workspace_root.iterdir(), key=lambda path: path.name.casefold()
-            )
-        ]
+        batch = self._boundary.directory_batch(".", MAX_LIST_VISITED_ENTRIES)
+        entries: list[dict[str, str]] = []
+        returned_bytes = 0
+        truncated = batch.truncated
+        for name in batch.names:
+            kind = self._boundary.entry_kind(name)
+            if kind is None:
+                continue
+            item = {"name": name, "kind": kind}
+            item_size = serialized_item_size(item)
+            if (
+                len(entries) >= MAX_LIST_RESULTS
+                or returned_bytes + item_size > MAX_LIST_RETURN_BYTES
+            ):
+                truncated = True
+                break
+            entries.append(item)
+            returned_bytes += item_size
+
         count = len(entries)
         noun = "entry" if count == 1 else "entries"
+        qualifier = " (truncated)" if truncated else ""
         return {
-            "workspace": self._workspace_root.name,
+            "workspace": self._boundary.workspace_name,
             "entries": entries,
             "entry_count": count,
-            "summary": f"Found {count} top-level {noun} in the configured workspace.",
+            "visited_entries": batch.visited_entries,
+            "visited_directories": MAX_LIST_VISITED_DIRECTORIES,
+            "max_depth": MAX_LIST_DEPTH,
+            "returned_bytes": returned_bytes,
+            "traversal_work": batch.visited_entries + MAX_LIST_VISITED_DIRECTORIES,
+            "truncated": truncated,
+            "summary": (f"Found {count} top-level {noun} in the configured workspace{qualifier}."),
         }
 
     def validate_arguments(self, arguments: dict[str, Any]) -> None:

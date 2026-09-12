@@ -81,11 +81,22 @@ class AgentEngine:
                 stage="plan_validation",
             ) from exc
 
+    def capture_approval_context(self, plan: ExecutionPlan) -> dict[str, Any]:
+        step = plan.steps[0]
+        try:
+            return self._tool_executor.capture_approval_context(
+                step.tool_name,
+                step.arguments,
+            )
+        except ToolError as exc:
+            raise AgentExecutionError(str(exc), stage="tool") from exc
+
     def execute(
         self,
         plan: ExecutionPlan,
         *,
         approved: bool = False,
+        approval_context: dict[str, Any] | None = None,
     ) -> AgentExecutionResult:
         step = plan.steps[0]
         try:
@@ -93,6 +104,7 @@ class AgentEngine:
                 step.tool_name,
                 step.arguments,
                 approved=approved,
+                approval_context=approval_context,
             )
         except ToolError as exc:
             raise AgentExecutionError(str(exc), stage="tool") from exc

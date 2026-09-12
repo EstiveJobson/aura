@@ -10,7 +10,7 @@ MAX_READ_BYTES = 256 * 1024
 
 
 class WorkspaceReadArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid")
 
     path: str = Field(
         min_length=1,
@@ -48,16 +48,10 @@ class WorkspaceReadTool:
     def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         validated = WorkspaceReadArguments.model_validate(arguments)
         try:
-            path = self._boundary.resolve_existing(validated.path)
-            if not path.is_file():
-                raise OSError
-            with path.open("rb") as stream:
-                payload = stream.read(MAX_READ_BYTES + 1)
+            payload = self._boundary.read_regular_file(validated.path, MAX_READ_BYTES)
         except OSError as exc:
             raise ValueError("The requested file is unavailable or unreadable.") from exc
 
-        if len(payload) > MAX_READ_BYTES:
-            raise ValueError("The requested file exceeds the read limit.")
         if b"\x00" in payload:
             raise ValueError("The requested file is binary or unsupported.")
         try:
@@ -65,7 +59,7 @@ class WorkspaceReadTool:
         except UnicodeDecodeError as exc:
             raise ValueError("The requested file is binary or unsupported.") from exc
 
-        relative_path = path.relative_to(self._boundary.root).as_posix()
+        relative_path = validated.path
         return {
             "path": relative_path,
             "size_bytes": len(payload),

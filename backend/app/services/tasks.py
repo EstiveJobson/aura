@@ -82,6 +82,9 @@ class TaskService:
                 steps=[step.model_dump(mode="json") for step in plan.steps],
             )
             requires_approval = self._agent_engine.requires_approval(plan)
+            approval_context = (
+                self._agent_engine.capture_approval_context(plan) if requires_approval else None
+            )
             execution_status = (
                 ExecutionStatus.WAITING_FOR_APPROVAL
                 if requires_approval
@@ -109,6 +112,7 @@ class TaskService:
                     Approval(
                         execution=execution,
                         decision=ApprovalDecision.PENDING,
+                        filesystem_preconditions=approval_context,
                     )
                 )
                 self._commit_or_raise("await_approval", task, execution, tool_call)
@@ -147,7 +151,11 @@ class TaskService:
         self._commit_or_raise("approve_execution", task, execution, tool_call)
 
         try:
-            outcome = self._agent_engine.execute(plan, approved=True)
+            outcome = self._agent_engine.execute(
+                plan,
+                approved=True,
+                approval_context=approval.filesystem_preconditions,
+            )
             self._complete_execution(
                 task,
                 execution,

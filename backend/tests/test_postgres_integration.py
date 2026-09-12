@@ -253,4 +253,5 @@ def test_postgres_persists_waiting_and_approved_execution_lifecycle(
             approval_record is not None
             and approval_record.decision is ApprovalDecision.APPROVED
             and approval_record.decided_at is not None
+            and approval_record.filesystem_preconditions is not None
         )

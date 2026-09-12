@@ -159,5 +159,6 @@ class Approval(Base):
     )
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    filesystem_preconditions: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     execution: Mapped[Execution] = relationship(back_populates="approval")
