@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -495,6 +497,7 @@ def test_mutating_task_waits_for_persisted_approval_then_executes_once(
     assert waiting["execution"]["status"] == "waiting_for_approval"
     assert waiting["execution"]["tool_calls"][0]["status"] == "waiting_for_approval"
     assert waiting["execution"]["approval"]["decision"] == "pending"
+    assert "filesystem_preconditions" not in waiting["execution"]["approval"]
     assert (tmp_path / "source.txt").exists()
     assert not (tmp_path / "moved.txt").exists()
 
@@ -533,6 +536,8 @@ def test_mutating_task_waits_for_persisted_approval_then_executes_once(
         assert execution is not None and execution.status is ExecutionStatus.SUCCEEDED
         assert tool_call is not None and tool_call.status is ToolCallStatus.SUCCEEDED
         assert approval is not None and approval.decision is ApprovalDecision.APPROVED
+        assert approval.filesystem_preconditions is not None
+        assert set(approval.filesystem_preconditions) == {"version", "workspace", "source"}
     engine.dispose()
 
 
@@ -594,6 +599,73 @@ def test_approval_revalidates_destination_and_persists_safe_failure(tmp_path: Pa
     assert body["error"] == 'Tool "workspace_move" could not be executed safely.'
     assert (tmp_path / "source.txt").read_text(encoding="utf-8") == "source"
     assert (tmp_path / "moved.txt").read_text(encoding="utf-8") == "new current state"
+    engine.dispose()
+
+
+def test_approval_rejects_a_replaced_source_and_requires_a_fresh_task(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("approved source", encoding="utf-8")
+    application, _, engine = build_test_application(tmp_path, build_move_engine(tmp_path))
+    created = asyncio.run(
+        request(
+            application,
+            "POST",
+            "/api/tasks",
+            json={"instruction": "Move source.txt to moved.txt."},
+        )
+    ).json()
+    replacement = tmp_path / "replacement.txt"
+    replacement.write_text("replacement", encoding="utf-8")
+    os.replace(replacement, source)
+
+    approved = asyncio.run(request(application, "POST", f"/api/tasks/{created['id']}/approve"))
+    duplicate = asyncio.run(request(application, "POST", f"/api/tasks/{created['id']}/approve"))
+
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "failed"
+    assert approved.json()["execution"]["approval"]["decision"] == "approved"
+    assert approved.json()["error"] == 'Tool "workspace_move" could not be executed safely.'
+    assert duplicate.status_code == 409
+    assert source.read_text(encoding="utf-8") == "replacement"
+    assert not (tmp_path / "moved.txt").exists()
+    engine.dispose()
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Linux permits replacing the configured root while its descriptor remains open.",
+)
+def test_approval_rejects_a_changed_workspace_identity(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "source.txt").write_text("approved source", encoding="utf-8")
+    application, _, engine = build_test_application(tmp_path, build_move_engine(workspace))
+    created = asyncio.run(
+        request(
+            application,
+            "POST",
+            "/api/tasks",
+            json={"instruction": "Move source.txt to moved.txt."},
+        )
+    ).json()
+
+    detached_workspace = tmp_path / "detached-workspace"
+    workspace.rename(detached_workspace)
+    workspace.mkdir()
+    (workspace / "source.txt").write_text("different workspace", encoding="utf-8")
+
+    approved = asyncio.run(request(application, "POST", f"/api/tasks/{created['id']}/approve"))
+    duplicate = asyncio.run(request(application, "POST", f"/api/tasks/{created['id']}/approve"))
+
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "failed"
+    assert duplicate.status_code == 409
+    assert (detached_workspace / "source.txt").read_text(encoding="utf-8") == ("approved source")
+    assert (workspace / "source.txt").read_text(encoding="utf-8") == "different workspace"
+    assert not (detached_workspace / "moved.txt").exists()
+    assert not (workspace / "moved.txt").exists()
     engine.dispose()
 
 

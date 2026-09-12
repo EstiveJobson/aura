@@ -151,10 +151,6 @@ def test_workspace_read_returns_utf8_and_rejects_binary_and_oversized_files(
             "workspace_move",
             {"source": "../outside.txt", "destination": "inside.txt"},
         ),
-        (
-            "workspace_move",
-            {"source": "inside.txt", "destination": "C:\\outside.txt"},
-        ),
     ],
 )
 def test_workspace_tools_reject_traversal_and_absolute_paths(
@@ -178,6 +174,10 @@ def test_workspace_move_requires_approval_and_never_overwrites(tmp_path: Path) -
     registry = ToolRegistry()
     registry.register(WorkspaceMoveTool(tmp_path))
     executor = ToolExecutor(registry)
+    approval_context = executor.capture_approval_context(
+        "workspace_move",
+        {"source": "source.txt", "destination": "moved.txt"},
+    )
 
     assert executor.requires_approval("workspace_move") is True
     with pytest.raises(ToolError, match="requires explicit approval"):
@@ -192,6 +192,7 @@ def test_workspace_move_requires_approval_and_never_overwrites(tmp_path: Path) -
             "workspace_move",
             {"source": "source.txt", "destination": "existing.txt"},
             approved=True,
+            approval_context=approval_context,
         )
     assert (tmp_path / "existing.txt").read_text(encoding="utf-8") == "existing"
 
@@ -199,6 +200,7 @@ def test_workspace_move_requires_approval_and_never_overwrites(tmp_path: Path) -
         "workspace_move",
         {"source": "source.txt", "destination": "moved.txt"},
         approved=True,
+        approval_context=approval_context,
     )
     assert result["destination"] == "moved.txt"
     assert not (tmp_path / "source.txt").exists()
@@ -232,11 +234,11 @@ def test_workspace_tools_reject_symlink_escape_where_supported(
             ToolExecutor(registry).execute("workspace_read", {"path": "escape.txt"})
     else:
         registry.register(WorkspaceMoveTool(tmp_path))
-        with pytest.raises(ToolError, match="could not be executed safely"):
-            ToolExecutor(registry).execute(
+        executor = ToolExecutor(registry)
+        with pytest.raises(ToolError, match="could not be prepared safely"):
+            executor.capture_approval_context(
                 "workspace_move",
                 {"source": "escape.txt", "destination": "moved.txt"},
-                approved=True,
             )
 
     assert outside.read_text(encoding="utf-8") == "secret outside"

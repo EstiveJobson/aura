@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +8,7 @@ from app.tools.workspace_paths import WorkspaceBoundary, validate_relative_path
 
 
 class WorkspaceMoveArguments(BaseModel):
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid")
 
     source: str = Field(
         min_length=1,
@@ -56,30 +55,24 @@ class WorkspaceMoveTool:
     def validate_arguments(self, arguments: dict[str, Any]) -> None:
         WorkspaceMoveArguments.model_validate(arguments)
 
-    def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def capture_approval_context(self, arguments: dict[str, Any]) -> dict[str, Any]:
         validated = WorkspaceMoveArguments.model_validate(arguments)
-        source = self._boundary.resolve_existing(validated.source)
-        destination = self._boundary.resolve_destination(validated.destination)
+        return self._boundary.approval_context(validated.source)
 
-        if not source.is_file():
-            raise ValueError("Only regular files can be moved.")
-        if destination.exists() or destination.is_symlink():
-            raise FileExistsError("The destination already exists.")
-        if source == destination:
-            raise ValueError("Source and destination must be different.")
-
-        destination_created = False
-        try:
-            os.link(source, destination, follow_symlinks=False)
-            destination_created = True
-            source.unlink()
-        except Exception:
-            if destination_created and destination.exists():
-                try:
-                    destination.unlink()
-                except OSError:
-                    pass
-            raise
+    def execute(
+        self,
+        arguments: dict[str, Any],
+        *,
+        approval_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        validated = WorkspaceMoveArguments.model_validate(arguments)
+        if approval_context is None:
+            raise ValueError("The persisted filesystem approval is required.")
+        self._boundary.move_no_replace(
+            validated.source,
+            validated.destination,
+            approval_context,
+        )
 
         source_path = validated.source
         destination_path = validated.destination

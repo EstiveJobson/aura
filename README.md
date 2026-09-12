@@ -17,8 +17,10 @@ The project scope and implementation order are governed by [`AURA_Project_Bluepr
 - `LLMPlanner` that receives all registered tool schemas, requests strict structured output, and locally validates exactly one selected tool call before persistence or execution.
 - Explicit application-owned `READ`/`WRITE` permissions: reads execute automatically and writes cannot execute without approval.
 - `workspace_list`, bounded literal `workspace_search`, bounded UTF-8 `workspace_read`, and approval-required `workspace_move` tools.
-- Fixed-root path validation that rejects absolute paths, traversal, symlink escapes, oversized reads, binary reads, and destination overwrites.
-- PostgreSQL persistence for tasks, plans, executions, tool calls, approval decisions, statuses, and results through SQLAlchemy and Alembic.
+- Descriptor/handle-anchored workspace acquisition that rejects symlinks, reparse points, special files, escapes, and stale workspace or source identities.
+- Atomic no-overwrite moves (`renameat2(RENAME_NOREPLACE)` on Linux and handle-based rename on Windows), with fail-closed behavior when the required primitive is unavailable.
+- Explicit list/search budgets for entries, directories, depth, traversal work, scanned bytes, result count, and returned bytes, with truncation reported in tool results.
+- PostgreSQL persistence for tasks, plans, executions, tool calls, approval decisions, application-generated filesystem preconditions, statuses, and results through SQLAlchemy and Alembic.
 - React, TypeScript, and Vite UI for planning, waiting, executing, completed, rejected, and failed states, including guarded Approve/Reject controls.
 - Reproducible local services through Docker Compose.
 - Backend linting, formatting, static typing, tests, and coverage enforcement.
@@ -61,7 +63,7 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-The backend applies pending Alembic migrations before starting the API. Application code remains under `/app`, while the host `workspace/` directory is mounted at the isolated container path `/workspace`. Every tool accepts only validated paths relative to that workspace root. `workspace_move` never overwrites and always waits for explicit approval.
+The backend applies pending Alembic migrations before starting the API. Application code remains under `/app`, while the host `workspace/` directory is mounted at the isolated container path `/workspace`. Every tool accepts only validated paths relative to that workspace root and acquires objects through that root. `workspace_move` never overwrites, always waits for explicit approval, and rejects an approval if the workspace or approved source identity changed while it was pending.
 
 The local development defaults in `.env.example` are not production credentials. Change them for any shared environment.
 

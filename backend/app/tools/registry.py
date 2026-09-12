@@ -1,6 +1,6 @@
 from typing import Any
 
-from app.tools.base import PermissionLevel, Tool, ToolDefinition
+from app.tools.base import ApprovalBoundTool, PermissionLevel, Tool, ToolDefinition
 
 
 class ToolError(RuntimeError):
@@ -51,18 +51,35 @@ class ToolExecutor:
         except Exception as exc:
             raise ToolError(f'Tool "{name}" received invalid arguments.') from exc
 
+    def capture_approval_context(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        tool = self._registry.get(name)
+        if tool.definition.permission is not PermissionLevel.WRITE or not isinstance(
+            tool, ApprovalBoundTool
+        ):
+            raise ToolError(f'Tool "{name}" cannot create a safe approval context.')
+        try:
+            self.validate_call(name, arguments)
+            return tool.capture_approval_context(arguments)
+        except Exception as exc:
+            raise ToolError(f'Tool "{name}" could not be prepared safely.') from exc
+
     def execute(
         self,
         name: str,
         arguments: dict[str, Any],
         *,
         approved: bool = False,
+        approval_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         tool = self._registry.get(name)
         if tool.definition.permission is PermissionLevel.WRITE and not approved:
             raise ToolApprovalRequired(f'Tool "{name}" requires explicit approval.')
         try:
             self.validate_call(name, arguments)
+            if tool.definition.permission is PermissionLevel.WRITE:
+                if not isinstance(tool, ApprovalBoundTool) or approval_context is None:
+                    raise ToolError(f'Tool "{name}" is missing its persisted approval context.')
+                return tool.execute(arguments, approval_context=approval_context)
             return tool.execute(arguments)
         except Exception as exc:
             raise ToolError(f'Tool "{name}" could not be executed safely.') from exc
