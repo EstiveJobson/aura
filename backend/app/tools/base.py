@@ -1,7 +1,9 @@
 from enum import StrEnum
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.core.constraints import TOOL_NAME_MAX_LENGTH
 
 
 class PermissionLevel(StrEnum):
@@ -11,7 +13,7 @@ class PermissionLevel(StrEnum):
 class ToolDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str
+    name: str = Field(min_length=1, max_length=TOOL_NAME_MAX_LENGTH)
     description: str
     permission: PermissionLevel
     parameters: dict[str, Any]

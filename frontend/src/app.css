@@ -319,6 +319,17 @@ h1 {
   font-weight: 750;
 }
 
+.execution-steps .stage-failed .step-index {
+  color: #fda4af;
+  background: rgb(136 19 55 / 28%);
+}
+
+.execution-steps .stage-pending .step-index,
+.execution-steps .stage-running .step-index {
+  color: #cbd5e1;
+  background: rgb(71 85 105 / 35%);
+}
+
 .execution-steps strong,
 .execution-steps li span:last-child {
   display: block;

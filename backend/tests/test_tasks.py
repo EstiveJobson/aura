@@ -1,23 +1,34 @@
 import asyncio
+import logging
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
+import pytest
 from fastapi import FastAPI
 from httpx2 import ASGITransport, AsyncClient, Response
 from sqlalchemy import Engine, create_engine, func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.agents import AgentEngine, ExecutionPlan, PlannedStep
+from app.agents import AgentEngine, GeneratedPlan, PlannedStep
 from app.core.config import Settings
 from app.database.base import Base
 from app.main import create_app
-from app.models import Execution, Plan, Task, TaskStatus, ToolCall
-from app.tools import ToolExecutor, ToolRegistry, WorkspaceListTool
+from app.models import Execution, ExecutionStatus, Plan, Task, TaskStatus, ToolCall, ToolCallStatus
+from app.services.tasks import PERSISTED_FAILURE_MESSAGE
+from app.tools import (
+    PermissionLevel,
+    ToolDefinition,
+    ToolExecutor,
+    ToolRegistry,
+    WorkspaceListTool,
+)
 
 
 class MissingToolPlanner:
-    def create_plan(self, instruction: str) -> ExecutionPlan:
-        return ExecutionPlan(
-            planner="failure-test-planner",
+    def create_plan(self, instruction: str) -> GeneratedPlan:
+        return GeneratedPlan(
             summary=f'Fail safely for "{instruction}".',
             steps=(
                 PlannedStep(
@@ -30,8 +41,65 @@ class MissingToolPlanner:
         )
 
 
+class PlannerFailure:
+    def create_plan(self, instruction: str) -> GeneratedPlan:
+        raise RuntimeError("raw provider payload with api_key=do-not-log")
+
+
+class ExplodingToolPlanner:
+    def create_plan(self, instruction: str) -> GeneratedPlan:
+        return GeneratedPlan(
+            summary=f'Exercise the tool boundary for "{instruction}".',
+            steps=(
+                PlannedStep(
+                    sequence=1,
+                    title="Run a registered failing tool",
+                    tool_name="exploding_tool",
+                    arguments={},
+                ),
+            ),
+        )
+
+
+class ExplodingTool:
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="exploding_tool",
+            description="Raise an internal exception for boundary testing.",
+            permission=PermissionLevel.READ,
+            parameters={},
+        )
+
+    def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("credential=do-not-log")
+
+
+class CompletionCommitFailureSession(Session):
+    _commit_attempts = 0
+
+    def commit(self) -> None:
+        self._commit_attempts += 1
+        if self._commit_attempts == 4:
+            self.flush()
+            raise SQLAlchemyError("database details with password=do-not-log")
+        super().commit()
+
+
+class PlanFlushFailureSession(Session):
+    _flush_attempts = 0
+
+    def flush(self, objects: Sequence[Any] | None = None) -> None:
+        self._flush_attempts += 1
+        if self._flush_attempts == 3:
+            raise SQLAlchemyError("database details with password=do-not-log")
+        super().flush(objects)
+
+
 def build_test_application(
-    tmp_path: Path, agent_engine: AgentEngine | None = None
+    tmp_path: Path,
+    agent_engine: AgentEngine | None = None,
+    session_class: type[Session] = Session,
 ) -> tuple[FastAPI, sessionmaker[Session], Engine]:
     database_path = tmp_path / "aura-test.db"
     engine = create_engine(
@@ -39,7 +107,12 @@ def build_test_application(
         connect_args={"check_same_thread": False},
     )
     Base.metadata.create_all(engine)
-    session_factory = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    session_factory = sessionmaker(
+        bind=engine,
+        class_=session_class,
+        autoflush=False,
+        expire_on_commit=False,
+    )
     settings = Settings(
         database_url=f"sqlite+pysqlite:///{database_path.as_posix()}",
         workspace_root=tmp_path,
@@ -117,26 +190,196 @@ def test_create_task_runs_and_persists_the_complete_vertical_slice(tmp_path: Pat
     engine.dispose()
 
 
-def test_tool_failure_is_persisted_and_returned_as_operational_status(tmp_path: Path) -> None:
+def test_unregistered_tool_plan_is_rejected_before_execution_persistence(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     registry = ToolRegistry()
     registry.register(WorkspaceListTool(tmp_path))
-    failing_engine = AgentEngine(MissingToolPlanner(), ToolExecutor(registry))
+    failing_engine = AgentEngine(
+        MissingToolPlanner(),
+        ToolExecutor(registry),
+        planner_name="failure-test-planner",
+    )
     application, session_factory, engine = build_test_application(tmp_path, failing_engine)
 
-    response = asyncio.run(
-        request(application, "POST", "/api/tasks", json={"instruction": "Fail safely."})
-    )
+    with caplog.at_level(logging.WARNING, logger="app.services.tasks"):
+        response = asyncio.run(
+            request(application, "POST", "/api/tasks", json={"instruction": "Fail safely."})
+        )
 
     assert response.status_code == 201
     body = response.json()
     assert body["status"] == "failed"
-    assert body["error"] == 'Tool "missing" is not registered.'
-    assert body["execution"]["status"] == "failed"
-    assert body["execution"]["tool_calls"][0]["status"] == "failed"
+    assert body["error"] == "The generated plan was rejected."
+    assert body["plan"] is None
+    assert body["execution"] is None
     with session_factory() as session:
         task = session.scalar(select(Task))
         assert task is not None
         assert task.status is TaskStatus.FAILED
+        assert session.scalar(select(func.count()).select_from(Plan)) == 0
+        assert session.scalar(select(func.count()).select_from(Execution)) == 0
+    failure_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("task execution failed")
+    ]
+    assert len(failure_records) == 1
+    assert getattr(failure_records[0], "failure_stage", None) == "plan_validation"
+    engine.dispose()
+
+
+def test_planner_failure_is_sanitized_persisted_and_logged_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry = ToolRegistry()
+    registry.register(WorkspaceListTool(tmp_path))
+    failing_engine = AgentEngine(
+        PlannerFailure(),
+        ToolExecutor(registry),
+        planner_name="failure-test-planner",
+    )
+    application, _, engine = build_test_application(tmp_path, failing_engine)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.tasks"):
+        response = asyncio.run(
+            request(application, "POST", "/api/tasks", json={"instruction": "Fail planning."})
+        )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["error"] == "The deterministic planner could not create a plan."
+    assert body["plan"] is None
+    assert body["execution"] is None
+    failure_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("task execution failed")
+    ]
+    assert len(failure_records) == 1
+    assert getattr(failure_records[0], "failure_stage", None) == "planner"
+    assert "api_key" not in caplog.text
+    engine.dispose()
+
+
+def test_actual_tool_exception_is_sanitized_persisted_and_logged_once(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry = ToolRegistry()
+    registry.register(ExplodingTool())
+    failing_engine = AgentEngine(
+        ExplodingToolPlanner(),
+        ToolExecutor(registry),
+        planner_name="failure-test-planner",
+    )
+    application, session_factory, engine = build_test_application(tmp_path, failing_engine)
+
+    with caplog.at_level(logging.WARNING, logger="app.services.tasks"):
+        response = asyncio.run(
+            request(application, "POST", "/api/tasks", json={"instruction": "Fail safely."})
+        )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["error"] == 'Tool "exploding_tool" could not be executed safely.'
+    assert body["plan"]["planner"] == "failure-test-planner"
+    assert body["execution"]["status"] == "failed"
+    assert body["execution"]["tool_calls"][0]["status"] == "failed"
+    with session_factory() as session:
+        task = session.scalar(select(Task))
+        execution = session.scalar(select(Execution))
+        tool_call = session.scalar(select(ToolCall))
+        assert task is not None and task.status is TaskStatus.FAILED
+        assert execution is not None and execution.status is ExecutionStatus.FAILED
+        assert tool_call is not None and tool_call.status is ToolCallStatus.FAILED
+    failure_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("task execution failed")
+    ]
+    assert len(failure_records) == 1
+    assert getattr(failure_records[0], "failure_stage", None) == "tool"
+    assert "credential" not in caplog.text
+    engine.dispose()
+
+
+def test_completion_commit_failure_returns_infrastructure_error_and_recovers_state(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    application, session_factory, engine = build_test_application(
+        tmp_path,
+        session_class=CompletionCommitFailureSession,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="app.services.tasks"):
+        response = asyncio.run(
+            request(application, "POST", "/api/tasks", json={"instruction": "List files."})
+        )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "code": "task_persistence_failed",
+        "message": "The task could not be persisted because storage is unavailable.",
+    }
+    with session_factory() as session:
+        task = session.scalar(select(Task))
+        execution = session.scalar(select(Execution))
+        tool_call = session.scalar(select(ToolCall))
+        assert task is not None and task.status is TaskStatus.FAILED
+        assert task.result is None
+        assert task.error == PERSISTED_FAILURE_MESSAGE
+        assert execution is not None and execution.status is ExecutionStatus.FAILED
+        assert execution.result is None
+        assert tool_call is not None and tool_call.status is ToolCallStatus.FAILED
+        assert tool_call.result is None
+    persistence_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("task persistence write failed")
+    ]
+    assert len(persistence_records) == 1
+    assert getattr(persistence_records[0], "persistence_operation", None) == "complete_execution"
+    assert getattr(persistence_records[0], "task_id", None)
+    assert getattr(persistence_records[0], "execution_id", None)
+    assert getattr(persistence_records[0], "tool_call_id", None)
+    assert getattr(persistence_records[0], "rollback_succeeded", None) is True
+    assert getattr(persistence_records[0], "failure_state_persisted", None) is True
+    assert "password" not in caplog.text
+    engine.dispose()
+
+
+def test_plan_flush_failure_rolls_back_and_marks_existing_task_failed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    application, session_factory, engine = build_test_application(
+        tmp_path,
+        session_class=PlanFlushFailureSession,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="app.services.tasks"):
+        response = asyncio.run(
+            request(application, "POST", "/api/tasks", json={"instruction": "List files."})
+        )
+
+    assert response.status_code == 503
+    with session_factory() as session:
+        task = session.scalar(select(Task))
+        assert task is not None and task.status is TaskStatus.FAILED
+        assert task.error == PERSISTED_FAILURE_MESSAGE
+        assert session.scalar(select(func.count()).select_from(Plan)) == 0
+        assert session.scalar(select(func.count()).select_from(Execution)) == 0
+        assert session.scalar(select(func.count()).select_from(ToolCall)) == 0
+    persistence_records = [
+        record
+        for record in caplog.records
+        if record.getMessage().startswith("task persistence write failed")
+    ]
+    assert len(persistence_records) == 1
+    assert getattr(persistence_records[0], "persistence_operation", None) == "prepare_execution"
+    assert getattr(persistence_records[0], "failure_state_persisted", None) is True
+    assert "password" not in caplog.text
     engine.dispose()
 
 

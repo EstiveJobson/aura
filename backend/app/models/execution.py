@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import JSON, DateTime, Enum, ForeignKey, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.constraints import PLANNER_NAME_MAX_LENGTH, TOOL_NAME_MAX_LENGTH
 from app.database.base import Base
 
 
@@ -65,7 +66,7 @@ class Plan(Base):
 
     id: Mapped[UUID] = mapped_column(Uuid, primary_key=True, default=uuid4)
     task_id: Mapped[UUID] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), unique=True)
-    planner: Mapped[str] = mapped_column(String(50))
+    planner: Mapped[str] = mapped_column(String(PLANNER_NAME_MAX_LENGTH))
     summary: Mapped[str] = mapped_column(Text)
     steps: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -106,7 +107,7 @@ class ToolCall(Base):
         ForeignKey("executions.id", ondelete="CASCADE"), index=True
     )
     plan_id: Mapped[UUID] = mapped_column(ForeignKey("plans.id", ondelete="CASCADE"), index=True)
-    tool_name: Mapped[str] = mapped_column(String(100))
+    tool_name: Mapped[str] = mapped_column(String(TOOL_NAME_MAX_LENGTH))
     arguments: Mapped[dict[str, Any]] = mapped_column(JSON)
     status: Mapped[ToolCallStatus] = mapped_column(
         Enum(
