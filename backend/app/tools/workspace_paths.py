@@ -14,6 +14,8 @@ from typing import Any, Literal, Protocol, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.tools.base import MutationOutcomeUnknown
+
 MAX_RELATIVE_PATH_LENGTH = 500
 
 _WINDOWS_RESERVED_NAMES = {
@@ -35,6 +37,10 @@ class WorkspacePathError(ValueError):
 
 class WorkspaceFileTooLarge(WorkspacePathError):
     """The acquired regular file exceeded its bounded read allowance."""
+
+    def __init__(self, message: str, *, bytes_consumed: int) -> None:
+        super().__init__(message)
+        self.bytes_consumed = bytes_consumed
 
 
 class FilesystemObjectIdentity(BaseModel):
@@ -407,7 +413,10 @@ class _LinuxWorkspaceBackend:
         finally:
             os.close(descriptor)
         if len(payload) > max_bytes:
-            raise WorkspaceFileTooLarge("The requested file exceeds the read limit.")
+            raise WorkspaceFileTooLarge(
+                "The requested file exceeds the read limit.",
+                bytes_consumed=len(payload),
+            )
         return payload
 
     @contextmanager
@@ -469,6 +478,10 @@ class _LinuxWorkspaceBackend:
                         }:
                             raise WorkspacePathError(
                                 "Atomic no-overwrite moves are unsupported on this filesystem."
+                            )
+                        if error_number == errno.EIO:
+                            raise MutationOutcomeUnknown(
+                                "The filesystem could not establish the move outcome."
                             )
                         raise WorkspacePathError("The requested move could not be completed.")
         finally:
@@ -848,7 +861,10 @@ class _WindowsWorkspaceBackend:
                 raise WorkspacePathError("The requested file is unavailable or unreadable.")
             payload = buffer.raw[: bytes_read.value]
         if len(payload) > max_bytes:
-            raise WorkspaceFileTooLarge("The requested file exceeds the read limit.")
+            raise WorkspaceFileTooLarge(
+                "The requested file exceeds the read limit.",
+                bytes_consumed=len(payload),
+            )
         return payload
 
     def move_no_replace(
@@ -907,6 +923,10 @@ class _WindowsWorkspaceBackend:
                         OSError,
                         getattr(ctypes, "WinError")(error_number),  # noqa: B009
                     )
+                    if error_number in {21, 1117, 1167}:
+                        raise MutationOutcomeUnknown(
+                            "The filesystem could not establish the move outcome."
+                        ) from windows_error
                     raise WorkspacePathError(
                         "The requested move could not be completed."
                     ) from windows_error
