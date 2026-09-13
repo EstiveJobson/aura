@@ -1,3 +1,7 @@
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session, sessionmaker
@@ -7,6 +11,7 @@ from app.api.routes import router as api_router
 from app.core.config import PlannerBackend, Settings, get_settings
 from app.database.session import create_database_engine, create_session_factory
 from app.providers import OpenAIProvider
+from app.services import TaskService
 from app.tools import (
     ToolExecutor,
     ToolRegistry,
@@ -15,6 +20,8 @@ from app.tools import (
     WorkspaceReadTool,
     WorkspaceSearchTool,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def build_agent_engine(settings: Settings) -> AgentEngine:
@@ -56,21 +63,36 @@ def create_app(
     if session_factory is None:
         database_engine = create_database_engine(app_settings.database_url)
         session_factory = create_session_factory(database_engine)
+    resolved_session_factory = session_factory
+    resolved_agent_engine = agent_engine or build_agent_engine(app_settings)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        with resolved_session_factory() as session:
+            reconciled = TaskService(
+                session,
+                resolved_agent_engine,
+            ).reconcile_stranded_executions()
+        if reconciled:
+            logger.warning("reconciled stranded executions count=%s", reconciled)
+        yield
 
     application = FastAPI(
         title=app_settings.app_name,
         version="0.1.0",
         description="AURA agentic workspace API",
+        lifespan=lifespan,
     )
     application.add_middleware(
         CORSMiddleware,
         allow_origins=app_settings.cors_origins,
         allow_credentials=True,
         allow_methods=["*"],
-        allow_headers=["*"],
+        allow_headers=["Content-Type", "X-AURA-Decision"],
     )
-    application.state.session_factory = session_factory
-    application.state.agent_engine = agent_engine or build_agent_engine(app_settings)
+    application.state.session_factory = resolved_session_factory
+    application.state.agent_engine = resolved_agent_engine
+    application.state.cors_origins = frozenset(app_settings.cors_origins)
     application.include_router(api_router, prefix=app_settings.api_prefix)
     return application
 

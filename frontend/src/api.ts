@@ -5,7 +5,8 @@ export type TaskStatus =
   | 'executing'
   | 'succeeded'
   | 'rejected'
-  | 'failed';
+  | 'failed'
+  | 'outcome_uncertain';
 
 export interface WorkspaceEntry {
   name: string;
@@ -39,7 +40,12 @@ export interface TaskResponse {
   execution: {
     id: string;
     status:
-      'waiting_for_approval' | 'running' | 'succeeded' | 'rejected' | 'failed';
+      | 'waiting_for_approval'
+      | 'running'
+      | 'succeeded'
+      | 'rejected'
+      | 'failed'
+      | 'outcome_uncertain';
     result: ToolResult | null;
     error: string | null;
     started_at: string;
@@ -53,7 +59,8 @@ export interface TaskResponse {
         | 'running'
         | 'succeeded'
         | 'rejected'
-        | 'failed';
+        | 'failed'
+        | 'outcome_uncertain';
       result: ToolResult | null;
       error: string | null;
       started_at: string;
@@ -95,6 +102,7 @@ async function decideTask(
 ): Promise<TaskResponse> {
   const response = await request(`${apiBaseUrl}/tasks/${taskId}/${decision}`, {
     method: 'POST',
+    headers: { 'X-AURA-Decision': decision },
   });
 
   if (!response.ok) {

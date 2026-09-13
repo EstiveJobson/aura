@@ -29,7 +29,11 @@ from app.models import (
     ToolCallStatus,
 )
 from app.providers import ProviderTimeoutError, StructuredGenerationRequest
-from app.services.tasks import PERSISTED_FAILURE_MESSAGE
+from app.services import TaskService
+from app.services.tasks import (
+    PERSISTED_FAILURE_MESSAGE,
+    UNCERTAIN_OUTCOME_MESSAGE,
+)
 from app.tools import (
     PermissionLevel,
     ToolDefinition,
@@ -150,6 +154,36 @@ class PlanFlushFailureSession(Session):
         super().flush(objects)
 
 
+class WriteCompletionCommitFailureSession(Session):
+    armed = False
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._commit_attempts = 0
+
+    def commit(self) -> None:
+        self._commit_attempts += 1
+        if type(self).armed and self._commit_attempts == 2:
+            self.flush()
+            raise SQLAlchemyError("database details with password=do-not-log")
+        super().commit()
+
+
+class CountingWorkspaceMoveTool(WorkspaceMoveTool):
+    def __init__(self, workspace_root: Path) -> None:
+        super().__init__(workspace_root)
+        self.invocations = 0
+
+    def execute(
+        self,
+        arguments: dict[str, Any],
+        *,
+        approval_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.invocations += 1
+        return super().execute(arguments, approval_context=approval_context)
+
+
 def build_test_application(
     tmp_path: Path,
     agent_engine: AgentEngine | None = None,
@@ -181,16 +215,31 @@ def build_test_application(
 
 
 async def request(
-    application: FastAPI, method: str, path: str, json: dict[str, Any] | None = None
+    application: FastAPI,
+    method: str,
+    path: str,
+    json: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> Response:
+    request_headers = headers
+    if request_headers is None and path.endswith(("/approve", "/reject")):
+        request_headers = {"X-AURA-Decision": "approve" if path.endswith("/approve") else "reject"}
     transport = ASGITransport(app=application)
     async with AsyncClient(transport=transport, base_url="http://testserver") as client:
-        return await client.request(method, path, json=json)
+        return await client.request(method, path, json=json, headers=request_headers)
 
 
-def build_move_engine(tmp_path: Path) -> AgentEngine:
+async def run_application_lifespan(application: FastAPI) -> None:
+    async with application.router.lifespan_context(application):
+        pass
+
+
+def build_move_engine(
+    tmp_path: Path,
+    move_tool: WorkspaceMoveTool | None = None,
+) -> AgentEngine:
     registry = ToolRegistry()
-    registry.register(WorkspaceMoveTool(tmp_path))
+    registry.register(move_tool or WorkspaceMoveTool(tmp_path))
     return AgentEngine(
         MovePlanner(),
         ToolExecutor(registry),
@@ -666,6 +715,200 @@ def test_approval_rejects_a_changed_workspace_identity(tmp_path: Path) -> None:
     assert (workspace / "source.txt").read_text(encoding="utf-8") == "different workspace"
     assert not (detached_workspace / "moved.txt").exists()
     assert not (workspace / "moved.txt").exists()
+    engine.dispose()
+
+
+def test_post_mutation_completion_failure_persists_uncertainty_without_replay(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("move exactly once", encoding="utf-8")
+    move_tool = CountingWorkspaceMoveTool(tmp_path)
+    application, session_factory, engine = build_test_application(
+        tmp_path,
+        build_move_engine(tmp_path, move_tool),
+        session_class=WriteCompletionCommitFailureSession,
+    )
+    created = asyncio.run(
+        request(
+            application,
+            "POST",
+            "/api/tasks",
+            json={"instruction": "Move source.txt to moved.txt."},
+        )
+    ).json()
+
+    WriteCompletionCommitFailureSession.armed = True
+    try:
+        response = asyncio.run(request(application, "POST", f"/api/tasks/{created['id']}/approve"))
+    finally:
+        WriteCompletionCommitFailureSession.armed = False
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "outcome_uncertain"
+    assert body["error"] == UNCERTAIN_OUTCOME_MESSAGE
+    assert body["execution"]["status"] == "outcome_uncertain"
+    assert body["execution"]["tool_calls"][0]["status"] == "outcome_uncertain"
+    assert body["execution"]["approval"]["decision"] == "approved"
+    assert not source.exists()
+    assert (tmp_path / "moved.txt").read_text(encoding="utf-8") == "move exactly once"
+    assert move_tool.invocations == 1
+
+    fetched = asyncio.run(request(application, "GET", f"/api/tasks/{created['id']}"))
+    duplicate = asyncio.run(request(application, "POST", f"/api/tasks/{created['id']}/approve"))
+    with session_factory() as session:
+        reconciled = TaskService(
+            session,
+            application.state.agent_engine,
+        ).reconcile_stranded_executions()
+
+    assert fetched.status_code == 200
+    assert fetched.json()["status"] == "outcome_uncertain"
+    assert duplicate.status_code == 409
+    assert reconciled == 0
+    assert move_tool.invocations == 1
+    engine.dispose()
+
+
+def test_stranded_approved_write_reconciliation_is_terminal_and_never_replays(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("still here", encoding="utf-8")
+    move_tool = CountingWorkspaceMoveTool(tmp_path)
+    agent_engine = build_move_engine(tmp_path, move_tool)
+    application, session_factory, engine = build_test_application(tmp_path, agent_engine)
+    created = asyncio.run(
+        request(
+            application,
+            "POST",
+            "/api/tasks",
+            json={"instruction": "Move source.txt to moved.txt."},
+        )
+    )
+    assert created.status_code == 201
+
+    with session_factory() as session:
+        task = session.scalar(select(Task))
+        execution = session.scalar(select(Execution))
+        tool_call = session.scalar(select(ToolCall))
+        approval = session.scalar(select(Approval))
+        assert task is not None
+        assert execution is not None
+        assert tool_call is not None
+        assert approval is not None
+        task.status = TaskStatus.EXECUTING
+        execution.status = ExecutionStatus.RUNNING
+        tool_call.status = ToolCallStatus.RUNNING
+        approval.decision = ApprovalDecision.APPROVED
+        approval.decided_at = task.updated_at
+        session.commit()
+
+    asyncio.run(run_application_lifespan(application))
+    with session_factory() as session:
+        assert TaskService(session, agent_engine).reconcile_stranded_executions() == 0
+
+    with session_factory() as session:
+        task = session.scalar(select(Task))
+        execution = session.scalar(select(Execution))
+        tool_call = session.scalar(select(ToolCall))
+        approval = session.scalar(select(Approval))
+        assert task is not None and task.status is TaskStatus.OUTCOME_UNCERTAIN
+        assert execution is not None and execution.status is ExecutionStatus.OUTCOME_UNCERTAIN
+        assert tool_call is not None and tool_call.status is ToolCallStatus.OUTCOME_UNCERTAIN
+        assert approval is not None and approval.decision is ApprovalDecision.APPROVED
+        assert task.error == UNCERTAIN_OUTCOME_MESSAGE
+    assert source.read_text(encoding="utf-8") == "still here"
+    assert not (tmp_path / "moved.txt").exists()
+    assert move_tool.invocations == 0
+    engine.dispose()
+
+
+@pytest.mark.parametrize("decision", ["approve", "reject"])
+def test_decision_requests_require_trusted_browser_origin_and_custom_header(
+    tmp_path: Path,
+    decision: str,
+) -> None:
+    (tmp_path / "source.txt").write_text("browser decision", encoding="utf-8")
+    application, _, engine = build_test_application(tmp_path, build_move_engine(tmp_path))
+    created = asyncio.run(
+        request(
+            application,
+            "POST",
+            "/api/tasks",
+            json={"instruction": "Move source.txt to moved.txt."},
+        )
+    ).json()
+    decision_path = f"/api/tasks/{created['id']}/{decision}"
+
+    untrusted = asyncio.run(
+        request(
+            application,
+            "POST",
+            decision_path,
+            headers={
+                "Origin": "https://attacker.example",
+                "X-AURA-Decision": decision,
+            },
+        )
+    )
+    missing = asyncio.run(
+        request(
+            application,
+            "POST",
+            decision_path,
+            headers={"Origin": "http://localhost:5173"},
+        )
+    )
+    invalid = asyncio.run(
+        request(
+            application,
+            "POST",
+            decision_path,
+            headers={
+                "Origin": "http://localhost:5173",
+                "X-AURA-Decision": "reject" if decision == "approve" else "approve",
+            },
+        )
+    )
+    preflight = asyncio.run(
+        request(
+            application,
+            "OPTIONS",
+            decision_path,
+            headers={
+                "Origin": "http://localhost:5173",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "X-AURA-Decision",
+            },
+        )
+    )
+    trusted = asyncio.run(
+        request(
+            application,
+            "POST",
+            decision_path,
+            headers={
+                "Origin": "http://localhost:5173",
+                "X-AURA-Decision": decision,
+            },
+        )
+    )
+
+    assert untrusted.status_code == 403
+    assert untrusted.json()["code"] == "decision_origin_rejected"
+    assert missing.status_code == 400
+    assert missing.json()["code"] == "decision_header_invalid"
+    assert invalid.status_code == 400
+    assert invalid.json()["code"] == "decision_header_invalid"
+    assert preflight.status_code == 200
+    assert preflight.headers["access-control-allow-origin"] == "http://localhost:5173"
+    assert "x-aura-decision" in preflight.headers["access-control-allow-headers"].lower()
+    assert trusted.status_code == 200
+    assert trusted.headers["access-control-allow-origin"] == "http://localhost:5173"
+    expected_status = "succeeded" if decision == "approve" else "rejected"
+    assert trusted.json()["status"] == expected_status
     engine.dispose()
 
 

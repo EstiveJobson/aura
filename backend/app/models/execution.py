@@ -24,6 +24,7 @@ class TaskStatus(StrEnum):
     SUCCEEDED = "succeeded"
     REJECTED = "rejected"
     FAILED = "failed"
+    OUTCOME_UNCERTAIN = "outcome_uncertain"
 
 
 class ExecutionStatus(StrEnum):
@@ -32,6 +33,7 @@ class ExecutionStatus(StrEnum):
     SUCCEEDED = "succeeded"
     REJECTED = "rejected"
     FAILED = "failed"
+    OUTCOME_UNCERTAIN = "outcome_uncertain"
 
 
 class ToolCallStatus(StrEnum):
@@ -40,6 +42,7 @@ class ToolCallStatus(StrEnum):
     SUCCEEDED = "succeeded"
     REJECTED = "rejected"
     FAILED = "failed"
+    OUTCOME_UNCERTAIN = "outcome_uncertain"
 
 
 class ApprovalDecision(StrEnum):

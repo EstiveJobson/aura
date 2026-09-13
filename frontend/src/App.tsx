@@ -44,6 +44,8 @@ function taskHeading(task: TaskResponse): string {
       return 'Task rejected';
     case 'failed':
       return 'Task failed';
+    case 'outcome_uncertain':
+      return 'Write outcome uncertain';
   }
 }
 
@@ -57,6 +59,12 @@ function taskMessage(task: TaskResponse): string {
   if (task.status === 'executing') {
     return 'The approved action is executing.';
   }
+  if (task.status === 'outcome_uncertain') {
+    return (
+      task.error ??
+      'The write may have completed, but its durable outcome is unknown. It will not be run again automatically.'
+    );
+  }
   return task.result ?? task.error ?? 'No final result has been persisted.';
 }
 
@@ -69,6 +77,7 @@ export function TaskResult({
   const approval = task.execution?.approval;
   const entries = workspaceEntries(task);
   const failed = task.status === 'failed';
+  const uncertain = task.status === 'outcome_uncertain';
   const planningStage = task.plan
     ? { state: 'completed', title: 'Plan created', detail: task.plan.summary }
     : failed
@@ -120,23 +129,31 @@ export function TaskResult({
             title: 'Tool failed',
             detail: toolCall.error ?? toolCall.tool_name,
           }
-        : toolCall.status === 'rejected'
+        : toolCall.status === 'outcome_uncertain'
           ? {
-              state: 'rejected',
-              title: 'Tool rejected',
-              detail: toolCall.tool_name,
+              state: 'uncertain',
+              title: 'Tool outcome uncertain',
+              detail:
+                toolCall.error ??
+                'The write will not be run again automatically.',
             }
-          : toolCall.status === 'waiting_for_approval'
+          : toolCall.status === 'rejected'
             ? {
-                state: 'pending',
-                title: 'Tool paused',
+                state: 'rejected',
+                title: 'Tool rejected',
                 detail: toolCall.tool_name,
               }
-            : {
-                state: 'running',
-                title: 'Tool executing',
-                detail: toolCall.tool_name,
-              }
+            : toolCall.status === 'waiting_for_approval'
+              ? {
+                  state: 'pending',
+                  title: 'Tool paused',
+                  detail: toolCall.tool_name,
+                }
+              : {
+                  state: 'running',
+                  title: 'Tool executing',
+                  detail: toolCall.tool_name,
+                }
     : {
         state: 'pending',
         title: failed || task.plan ? 'Tool not started' : 'Tool pending',
@@ -158,7 +175,7 @@ export function TaskResult({
         <span className={`status-pill ${task.status}`}>{task.status}</span>
       </div>
 
-      <p className={failed ? 'error-result' : 'final-result'}>
+      <p className={failed || uncertain ? 'error-result' : 'final-result'}>
         {taskMessage(task)}
       </p>
 
@@ -316,7 +333,7 @@ export function App() {
           <span className="brand-mark">A</span>
           <span>AURA</span>
         </a>
-        <span className="phase-badge">Phase 3 · guarded tools</span>
+        <span className="phase-badge">Phase 3.2 · lifecycle hardening</span>
       </header>
 
       <main>
