@@ -165,6 +165,34 @@ const rejectedTask: TaskResponse = {
   },
 };
 
+const uncertainTask: TaskResponse = {
+  ...waitingTask,
+  status: 'outcome_uncertain',
+  error:
+    'The approved write may have changed the workspace, but its durable completion state is unknown. It will not be run again automatically.',
+  execution: {
+    ...waitingTask.execution!,
+    status: 'outcome_uncertain',
+    error:
+      'The approved write may have changed the workspace, but its durable completion state is unknown. It will not be run again automatically.',
+    completed_at: '2026-09-11T15:00:02Z',
+    tool_calls: [
+      {
+        ...waitingTask.execution!.tool_calls[0],
+        status: 'outcome_uncertain',
+        error:
+          'The approved write may have changed the workspace, but its durable completion state is unknown. It will not be run again automatically.',
+        completed_at: '2026-09-11T15:00:02Z',
+      },
+    ],
+    approval: {
+      ...waitingTask.execution!.approval!,
+      decision: 'approved',
+      decided_at: '2026-09-11T15:00:01Z',
+    },
+  },
+};
+
 const failedPlanningTask: TaskResponse = {
   ...completedTask,
   status: 'failed',
@@ -259,6 +287,19 @@ describe('App', () => {
     expect(rejectedMarkup).not.toContain('approval-controls');
   });
 
+  it('renders an uncertain write outcome without approval controls or replay claims', () => {
+    const markup = renderToStaticMarkup(
+      <TaskResult task={uncertainTask} onDecision={vi.fn()} />,
+    );
+
+    expect(markup).toContain('Write outcome uncertain');
+    expect(markup).toContain('Tool outcome uncertain');
+    expect(markup).toContain('will not be run again automatically');
+    expect(markup).toContain('Action approved');
+    expect(markup).not.toContain('approval-controls');
+    expect(markup).not.toContain('Tool completed');
+  });
+
   it('models submitting, completed, and request failure UI states', () => {
     const submitting = taskExecutionReducer(initialTaskExecutionState, {
       type: 'submit',
@@ -319,12 +360,18 @@ describe('App', () => {
     expect(request).toHaveBeenNthCalledWith(
       1,
       expect.stringMatching(/\/tasks\/.+\/approve$/),
-      { method: 'POST' },
+      {
+        method: 'POST',
+        headers: { 'X-AURA-Decision': 'approve' },
+      },
     );
     expect(request).toHaveBeenNthCalledWith(
       2,
       expect.stringMatching(/\/tasks\/.+\/reject$/),
-      { method: 'POST' },
+      {
+        method: 'POST',
+        headers: { 'X-AURA-Decision': 'reject' },
+      },
     );
   });
 

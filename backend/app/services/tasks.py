@@ -1,4 +1,7 @@
 import logging
+from dataclasses import dataclass
+from datetime import datetime
+from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -27,8 +30,141 @@ logger = logging.getLogger(__name__)
 
 PERSISTENCE_FAILURE_MESSAGE = "The task could not be persisted because storage is unavailable."
 PERSISTED_FAILURE_MESSAGE = "Task execution failed because its state could not be persisted."
+UNCERTAIN_OUTCOME_MESSAGE = (
+    "The approved write may have changed the workspace, but its durable completion state "
+    "is unknown. It will not be run again automatically."
+)
+INTERRUPTED_EXECUTION_MESSAGE = (
+    "Task execution was interrupted before a durable outcome was recorded."
+)
 TASK_NOT_FOUND_MESSAGE = "Task was not found."
 TASK_STATE_CONFLICT_MESSAGE = "Task is not waiting for approval."
+STRANDED_RECONCILIATION_LIMIT = 100
+
+
+class RecoveryTarget(StrEnum):
+    FAILED = "failed"
+    OUTCOME_UNCERTAIN = "outcome_uncertain"
+    PRESERVE = "preserve"
+
+
+class RecoveryResult(StrEnum):
+    NOT_APPLIED = "not_applied"
+    FAILED = "failed"
+    OUTCOME_UNCERTAIN = "outcome_uncertain"
+    PRESERVED = "preserved"
+
+
+@dataclass(frozen=True)
+class RecoveryPolicy:
+    expected_task_status: TaskStatus
+    expected_execution_status: ExecutionStatus | None
+    expected_tool_call_status: ToolCallStatus | None
+    expected_approval_decision: ApprovalDecision | None
+    target: RecoveryTarget
+
+
+PENDING_TASK_FAILURE = RecoveryPolicy(
+    TaskStatus.PENDING,
+    None,
+    None,
+    None,
+    RecoveryTarget.FAILED,
+)
+PLANNING_TASK_FAILURE = RecoveryPolicy(
+    TaskStatus.PLANNING,
+    None,
+    None,
+    None,
+    RecoveryTarget.FAILED,
+)
+WAITING_DECISION_PRESERVE = RecoveryPolicy(
+    TaskStatus.WAITING_FOR_APPROVAL,
+    ExecutionStatus.WAITING_FOR_APPROVAL,
+    ToolCallStatus.WAITING_FOR_APPROVAL,
+    ApprovalDecision.PENDING,
+    RecoveryTarget.PRESERVE,
+)
+READ_EXECUTION_FAILURE = RecoveryPolicy(
+    TaskStatus.EXECUTING,
+    ExecutionStatus.RUNNING,
+    ToolCallStatus.RUNNING,
+    None,
+    RecoveryTarget.FAILED,
+)
+WRITE_EXECUTION_FAILURE = RecoveryPolicy(
+    TaskStatus.EXECUTING,
+    ExecutionStatus.RUNNING,
+    ToolCallStatus.RUNNING,
+    ApprovalDecision.APPROVED,
+    RecoveryTarget.FAILED,
+)
+WRITE_COMPLETION_UNCERTAIN = RecoveryPolicy(
+    TaskStatus.EXECUTING,
+    ExecutionStatus.RUNNING,
+    ToolCallStatus.RUNNING,
+    ApprovalDecision.APPROVED,
+    RecoveryTarget.OUTCOME_UNCERTAIN,
+)
+
+
+TASK_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
+    TaskStatus.PENDING: frozenset({TaskStatus.PLANNING, TaskStatus.FAILED}),
+    TaskStatus.PLANNING: frozenset(
+        {
+            TaskStatus.WAITING_FOR_APPROVAL,
+            TaskStatus.EXECUTING,
+            TaskStatus.FAILED,
+        }
+    ),
+    TaskStatus.WAITING_FOR_APPROVAL: frozenset(
+        {TaskStatus.EXECUTING, TaskStatus.REJECTED, TaskStatus.FAILED}
+    ),
+    TaskStatus.EXECUTING: frozenset(
+        {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.OUTCOME_UNCERTAIN}
+    ),
+    TaskStatus.SUCCEEDED: frozenset(),
+    TaskStatus.REJECTED: frozenset(),
+    TaskStatus.FAILED: frozenset(),
+    TaskStatus.OUTCOME_UNCERTAIN: frozenset(),
+}
+EXECUTION_TRANSITIONS: dict[ExecutionStatus, frozenset[ExecutionStatus]] = {
+    ExecutionStatus.WAITING_FOR_APPROVAL: frozenset(
+        {ExecutionStatus.RUNNING, ExecutionStatus.REJECTED, ExecutionStatus.FAILED}
+    ),
+    ExecutionStatus.RUNNING: frozenset(
+        {
+            ExecutionStatus.SUCCEEDED,
+            ExecutionStatus.FAILED,
+            ExecutionStatus.OUTCOME_UNCERTAIN,
+        }
+    ),
+    ExecutionStatus.SUCCEEDED: frozenset(),
+    ExecutionStatus.REJECTED: frozenset(),
+    ExecutionStatus.FAILED: frozenset(),
+    ExecutionStatus.OUTCOME_UNCERTAIN: frozenset(),
+}
+TOOL_CALL_TRANSITIONS: dict[ToolCallStatus, frozenset[ToolCallStatus]] = {
+    ToolCallStatus.WAITING_FOR_APPROVAL: frozenset(
+        {ToolCallStatus.RUNNING, ToolCallStatus.REJECTED, ToolCallStatus.FAILED}
+    ),
+    ToolCallStatus.RUNNING: frozenset(
+        {
+            ToolCallStatus.SUCCEEDED,
+            ToolCallStatus.FAILED,
+            ToolCallStatus.OUTCOME_UNCERTAIN,
+        }
+    ),
+    ToolCallStatus.SUCCEEDED: frozenset(),
+    ToolCallStatus.REJECTED: frozenset(),
+    ToolCallStatus.FAILED: frozenset(),
+    ToolCallStatus.OUTCOME_UNCERTAIN: frozenset(),
+}
+APPROVAL_TRANSITIONS: dict[ApprovalDecision, frozenset[ApprovalDecision]] = {
+    ApprovalDecision.PENDING: frozenset({ApprovalDecision.APPROVED, ApprovalDecision.REJECTED}),
+    ApprovalDecision.APPROVED: frozenset(),
+    ApprovalDecision.REJECTED: frozenset(),
+}
 
 
 class TaskPersistenceError(RuntimeError):
@@ -57,6 +193,34 @@ class TaskStateConflictError(RuntimeError):
         self.message = TASK_STATE_CONFLICT_MESSAGE
 
 
+class _TaskOutcomeUncertainError(RuntimeError):
+    """Internal signal that uncertainty was persisted after a completion write failed."""
+
+
+def _transition_task(task: Task, target: TaskStatus) -> None:
+    if target not in TASK_TRANSITIONS[task.status]:
+        raise RuntimeError(f"Invalid task transition: {task.status} -> {target}.")
+    task.status = target
+
+
+def _transition_execution(execution: Execution, target: ExecutionStatus) -> None:
+    if target not in EXECUTION_TRANSITIONS[execution.status]:
+        raise RuntimeError(f"Invalid execution transition: {execution.status} -> {target}.")
+    execution.status = target
+
+
+def _transition_tool_call(tool_call: ToolCall, target: ToolCallStatus) -> None:
+    if target not in TOOL_CALL_TRANSITIONS[tool_call.status]:
+        raise RuntimeError(f"Invalid tool-call transition: {tool_call.status} -> {target}.")
+    tool_call.status = target
+
+
+def _transition_approval(approval: Approval, target: ApprovalDecision) -> None:
+    if target not in APPROVAL_TRANSITIONS[approval.decision]:
+        raise RuntimeError(f"Invalid approval transition: {approval.decision} -> {target}.")
+    approval.decision = target
+
+
 class TaskService:
     def __init__(self, session: Session, agent_engine: AgentEngine) -> None:
         self._session = session
@@ -65,14 +229,22 @@ class TaskService:
     def create_and_execute(self, instruction: str) -> Task:
         task = Task(id=uuid4(), instruction=instruction, status=TaskStatus.PENDING)
         self._session.add(task)
-        self._commit_or_raise("create_task", task)
+        self._commit_or_raise(
+            "create_task",
+            task,
+            recovery_policy=PENDING_TASK_FAILURE,
+        )
 
         plan_record: Plan | None = None
         execution: Execution | None = None
         tool_call: ToolCall | None = None
         try:
-            task.status = TaskStatus.PLANNING
-            self._commit_or_raise("start_planning", task)
+            _transition_task(task, TaskStatus.PLANNING)
+            self._commit_or_raise(
+                "start_planning",
+                task,
+                recovery_policy=PENDING_TASK_FAILURE,
+            )
 
             plan = self._agent_engine.create_plan(instruction)
             plan_record = Plan(
@@ -95,7 +267,12 @@ class TaskService:
             )
             execution = Execution(task=task, status=execution_status)
             self._session.add_all((plan_record, execution))
-            self._flush_or_raise("prepare_execution", task, execution)
+            self._flush_or_raise(
+                "prepare_execution",
+                task,
+                execution,
+                recovery_policy=PLANNING_TASK_FAILURE,
+            )
 
             step = plan.steps[0]
             tool_call = ToolCall(
@@ -107,7 +284,7 @@ class TaskService:
             )
             self._session.add(tool_call)
             if requires_approval:
-                task.status = TaskStatus.WAITING_FOR_APPROVAL
+                _transition_task(task, TaskStatus.WAITING_FOR_APPROVAL)
                 self._session.add(
                     Approval(
                         execution=execution,
@@ -115,10 +292,22 @@ class TaskService:
                         filesystem_preconditions=approval_context,
                     )
                 )
-                self._commit_or_raise("await_approval", task, execution, tool_call)
+                self._commit_or_raise(
+                    "await_approval",
+                    task,
+                    execution,
+                    tool_call,
+                    recovery_policy=PLANNING_TASK_FAILURE,
+                )
             else:
-                task.status = TaskStatus.EXECUTING
-                self._commit_or_raise("start_execution", task, execution, tool_call)
+                _transition_task(task, TaskStatus.EXECUTING)
+                self._commit_or_raise(
+                    "start_execution",
+                    task,
+                    execution,
+                    tool_call,
+                    recovery_policy=PLANNING_TASK_FAILURE,
+                )
 
                 outcome = self._agent_engine.execute(plan)
                 self._complete_execution(
@@ -127,6 +316,7 @@ class TaskService:
                     tool_call,
                     outcome.output,
                     outcome.final_result,
+                    uncertain_on_persistence_failure=False,
                 )
         except AgentExecutionError as exc:
             self._log_execution_failure(exc, task, execution, tool_call)
@@ -143,12 +333,18 @@ class TaskService:
             raise TaskStateConflictError
 
         decided_at = utc_now()
-        approval.decision = ApprovalDecision.APPROVED
+        _transition_approval(approval, ApprovalDecision.APPROVED)
         approval.decided_at = decided_at
-        task.status = TaskStatus.EXECUTING
-        execution.status = ExecutionStatus.RUNNING
-        tool_call.status = ToolCallStatus.RUNNING
-        self._commit_or_raise("approve_execution", task, execution, tool_call)
+        _transition_task(task, TaskStatus.EXECUTING)
+        _transition_execution(execution, ExecutionStatus.RUNNING)
+        _transition_tool_call(tool_call, ToolCallStatus.RUNNING)
+        self._commit_or_raise(
+            "approve_execution",
+            task,
+            execution,
+            tool_call,
+            recovery_policy=WAITING_DECISION_PRESERVE,
+        )
 
         try:
             outcome = self._agent_engine.execute(
@@ -162,7 +358,10 @@ class TaskService:
                 tool_call,
                 outcome.output,
                 outcome.final_result,
+                uncertain_on_persistence_failure=True,
             )
+        except _TaskOutcomeUncertainError:
+            return self._reload_created_task(task, execution, tool_call)
         except AgentExecutionError as exc:
             self._log_execution_failure(exc, task, execution, tool_call)
             self._mark_execution_failed(task, execution, tool_call, str(exc))
@@ -172,20 +371,26 @@ class TaskService:
         task = self._get_for_decision(task_id)
         execution, tool_call, approval = self._require_waiting_for_approval(task)
         completed_at = utc_now()
-        approval.decision = ApprovalDecision.REJECTED
+        _transition_approval(approval, ApprovalDecision.REJECTED)
         approval.decided_at = completed_at
-        task.status = TaskStatus.REJECTED
+        _transition_task(task, TaskStatus.REJECTED)
         task.result = None
         task.error = None
-        execution.status = ExecutionStatus.REJECTED
+        _transition_execution(execution, ExecutionStatus.REJECTED)
         execution.result = None
         execution.error = None
         execution.completed_at = completed_at
-        tool_call.status = ToolCallStatus.REJECTED
+        _transition_tool_call(tool_call, ToolCallStatus.REJECTED)
         tool_call.result = None
         tool_call.error = None
         tool_call.completed_at = completed_at
-        self._commit_or_raise("reject_execution", task, execution, tool_call)
+        self._commit_or_raise(
+            "reject_execution",
+            task,
+            execution,
+            tool_call,
+            recovery_policy=WAITING_DECISION_PRESERVE,
+        )
         return self._reload_created_task(task, execution, tool_call)
 
     def _reload_created_task(
@@ -194,6 +399,7 @@ class TaskService:
         execution: Execution | None,
         tool_call: ToolCall | None,
     ) -> Task:
+        self._session.expire_all()
         persisted_task = self.get(task.id)
         if persisted_task is None:
             logger.error(
@@ -316,20 +522,33 @@ class TaskService:
         tool_call: ToolCall,
         output: dict[str, Any],
         final_result: str,
+        *,
+        uncertain_on_persistence_failure: bool,
     ) -> None:
         completed_at = utc_now()
-        tool_call.status = ToolCallStatus.SUCCEEDED
+        _transition_tool_call(tool_call, ToolCallStatus.SUCCEEDED)
         tool_call.result = output
         tool_call.error = None
         tool_call.completed_at = completed_at
-        execution.status = ExecutionStatus.SUCCEEDED
+        _transition_execution(execution, ExecutionStatus.SUCCEEDED)
         execution.result = output
         execution.error = None
         execution.completed_at = completed_at
-        task.status = TaskStatus.SUCCEEDED
+        _transition_task(task, TaskStatus.SUCCEEDED)
         task.result = final_result
         task.error = None
-        self._commit_or_raise("complete_execution", task, execution, tool_call)
+        recovery_policy = (
+            WRITE_COMPLETION_UNCERTAIN
+            if uncertain_on_persistence_failure
+            else READ_EXECUTION_FAILURE
+        )
+        self._commit_or_raise(
+            "complete_execution",
+            task,
+            execution,
+            tool_call,
+            recovery_policy=recovery_policy,
+        )
 
     def _mark_execution_failed(
         self,
@@ -340,19 +559,31 @@ class TaskService:
     ) -> None:
         completed_at = utc_now()
         if tool_call is not None:
-            tool_call.status = ToolCallStatus.FAILED
+            _transition_tool_call(tool_call, ToolCallStatus.FAILED)
             tool_call.result = None
             tool_call.error = error
             tool_call.completed_at = completed_at
         if execution is not None:
-            execution.status = ExecutionStatus.FAILED
+            _transition_execution(execution, ExecutionStatus.FAILED)
             execution.result = None
             execution.error = error
             execution.completed_at = completed_at
-        task.status = TaskStatus.FAILED
+        _transition_task(task, TaskStatus.FAILED)
         task.result = None
         task.error = error
-        self._commit_or_raise("record_execution_failure", task, execution, tool_call)
+        if execution is None:
+            recovery_policy = PLANNING_TASK_FAILURE
+        elif execution.approval is None:
+            recovery_policy = READ_EXECUTION_FAILURE
+        else:
+            recovery_policy = WRITE_EXECUTION_FAILURE
+        self._commit_or_raise(
+            "record_execution_failure",
+            task,
+            execution,
+            tool_call,
+            recovery_policy=recovery_policy,
+        )
 
     def _commit_or_raise(
         self,
@@ -360,6 +591,8 @@ class TaskService:
         task: Task,
         execution: Execution | None = None,
         tool_call: ToolCall | None = None,
+        *,
+        recovery_policy: RecoveryPolicy | None = None,
     ) -> None:
         task_id = task.id
         execution_id = execution.id if execution is not None else None
@@ -373,6 +606,7 @@ class TaskService:
                 task_id,
                 execution_id,
                 tool_call_id,
+                recovery_policy,
             )
 
     def _flush_or_raise(
@@ -381,6 +615,8 @@ class TaskService:
         task: Task,
         execution: Execution | None = None,
         tool_call: ToolCall | None = None,
+        *,
+        recovery_policy: RecoveryPolicy | None = None,
     ) -> None:
         task_id = task.id
         execution_id = execution.id if execution is not None else None
@@ -394,6 +630,7 @@ class TaskService:
                 task_id,
                 execution_id,
                 tool_call_id,
+                recovery_policy,
             )
 
     def _handle_write_failure(
@@ -403,20 +640,27 @@ class TaskService:
         task_id: UUID,
         execution_id: UUID | None,
         tool_call_id: UUID | None,
+        recovery_policy: RecoveryPolicy | None,
     ) -> None:
         bind = self._session.get_bind()
         rollback_succeeded = self._rollback()
         failure_state_persisted = False
+        recovery_result = RecoveryResult.NOT_APPLIED
         recovery_error_type: str | None = None
 
-        if rollback_succeeded:
+        if rollback_succeeded and recovery_policy is not None:
             try:
-                failure_state_persisted = self._recover_failed_lifecycle(
+                recovery_result = self._recover_failed_lifecycle(
                     bind,
                     task_id,
                     execution_id,
                     tool_call_id,
+                    recovery_policy,
                 )
+                failure_state_persisted = recovery_result in {
+                    RecoveryResult.FAILED,
+                    RecoveryResult.OUTCOME_UNCERTAIN,
+                }
             except SQLAlchemyError as recovery_error:
                 recovery_error_type = type(recovery_error).__name__
 
@@ -424,7 +668,7 @@ class TaskService:
             (
                 "task persistence write failed task_id=%s execution_id=%s "
                 "tool_call_id=%s operation=%s error_type=%s rollback_succeeded=%s "
-                "failure_state_persisted=%s recovery_error_type=%s"
+                "failure_state_persisted=%s recovery_result=%s recovery_error_type=%s"
             ),
             task_id,
             execution_id,
@@ -433,6 +677,7 @@ class TaskService:
             type(error).__name__,
             rollback_succeeded,
             failure_state_persisted,
+            recovery_result,
             recovery_error_type,
             extra={
                 "task_id": str(task_id),
@@ -442,9 +687,12 @@ class TaskService:
                 "database_error_type": type(error).__name__,
                 "rollback_succeeded": rollback_succeeded,
                 "failure_state_persisted": failure_state_persisted,
+                "recovery_result": recovery_result,
                 "recovery_error_type": recovery_error_type,
             },
         )
+        if recovery_result is RecoveryResult.OUTCOME_UNCERTAIN:
+            raise _TaskOutcomeUncertainError from error
         raise TaskPersistenceError from error
 
     @staticmethod
@@ -453,35 +701,210 @@ class TaskService:
         task_id: UUID,
         execution_id: UUID | None,
         tool_call_id: UUID | None,
-    ) -> bool:
+        policy: RecoveryPolicy,
+    ) -> RecoveryResult:
         with Session(bind=bind, autoflush=False, expire_on_commit=False) as recovery_session:
-            persisted_task = recovery_session.get(Task, task_id)
+            statement = (
+                select(Task)
+                .where(Task.id == task_id)
+                .options(
+                    selectinload(Task.execution).selectinload(Execution.tool_calls),
+                    selectinload(Task.execution).selectinload(Execution.approval),
+                )
+                .with_for_update()
+            )
+            persisted_task = recovery_session.scalar(statement)
+            if not TaskService._matches_recovery_policy(
+                persisted_task,
+                execution_id,
+                tool_call_id,
+                policy,
+            ):
+                recovery_session.rollback()
+                return RecoveryResult.NOT_APPLIED
+
+            if policy.target is RecoveryTarget.PRESERVE:
+                recovery_session.rollback()
+                return RecoveryResult.PRESERVED
             if persisted_task is None:
-                return False
+                raise RuntimeError("Matched recovery policy without a persisted task.")
 
             completed_at = utc_now()
-            persisted_task.status = TaskStatus.FAILED
+            task_target = (
+                TaskStatus.OUTCOME_UNCERTAIN
+                if policy.target is RecoveryTarget.OUTCOME_UNCERTAIN
+                else TaskStatus.FAILED
+            )
+            execution_target = (
+                ExecutionStatus.OUTCOME_UNCERTAIN
+                if policy.target is RecoveryTarget.OUTCOME_UNCERTAIN
+                else ExecutionStatus.FAILED
+            )
+            tool_call_target = (
+                ToolCallStatus.OUTCOME_UNCERTAIN
+                if policy.target is RecoveryTarget.OUTCOME_UNCERTAIN
+                else ToolCallStatus.FAILED
+            )
+            message = (
+                UNCERTAIN_OUTCOME_MESSAGE
+                if policy.target is RecoveryTarget.OUTCOME_UNCERTAIN
+                else PERSISTED_FAILURE_MESSAGE
+            )
+
+            _transition_task(persisted_task, task_target)
             persisted_task.result = None
-            persisted_task.error = PERSISTED_FAILURE_MESSAGE
+            persisted_task.error = message
 
-            if execution_id is not None:
-                persisted_execution = recovery_session.get(Execution, execution_id)
-                if persisted_execution is not None:
-                    persisted_execution.status = ExecutionStatus.FAILED
-                    persisted_execution.result = None
-                    persisted_execution.error = PERSISTED_FAILURE_MESSAGE
-                    persisted_execution.completed_at = completed_at
+            persisted_execution = persisted_task.execution
+            if persisted_execution is not None:
+                _transition_execution(persisted_execution, execution_target)
+                persisted_execution.result = None
+                persisted_execution.error = message
+                persisted_execution.completed_at = completed_at
 
-            if tool_call_id is not None:
-                persisted_tool_call = recovery_session.get(ToolCall, tool_call_id)
-                if persisted_tool_call is not None:
-                    persisted_tool_call.status = ToolCallStatus.FAILED
-                    persisted_tool_call.result = None
-                    persisted_tool_call.error = PERSISTED_FAILURE_MESSAGE
-                    persisted_tool_call.completed_at = completed_at
+                persisted_tool_call = persisted_execution.tool_calls[0]
+                _transition_tool_call(persisted_tool_call, tool_call_target)
+                persisted_tool_call.result = None
+                persisted_tool_call.error = message
+                persisted_tool_call.completed_at = completed_at
 
             recovery_session.commit()
+            if policy.target is RecoveryTarget.OUTCOME_UNCERTAIN:
+                return RecoveryResult.OUTCOME_UNCERTAIN
+            return RecoveryResult.FAILED
+
+    @staticmethod
+    def _matches_recovery_policy(
+        task: Task | None,
+        execution_id: UUID | None,
+        tool_call_id: UUID | None,
+        policy: RecoveryPolicy,
+    ) -> bool:
+        if task is None or task.status is not policy.expected_task_status:
+            return False
+
+        execution = task.execution
+        if policy.expected_execution_status is None:
+            return execution is None
+        if (
+            execution is None
+            or execution_id is None
+            or execution.id != execution_id
+            or execution.status is not policy.expected_execution_status
+            or len(execution.tool_calls) != 1
+        ):
+            return False
+
+        tool_call = execution.tool_calls[0]
+        if (
+            tool_call_id is None
+            or tool_call.id != tool_call_id
+            or tool_call.status is not policy.expected_tool_call_status
+        ):
+            return False
+
+        approval = execution.approval
+        if policy.expected_approval_decision is None:
+            return approval is None
+        return approval is not None and approval.decision is policy.expected_approval_decision
+
+    def reconcile_stranded_executions(
+        self,
+        *,
+        before: datetime | None = None,
+        limit: int = STRANDED_RECONCILIATION_LIMIT,
+    ) -> int:
+        """Finalize a bounded startup batch without ever re-executing a tool."""
+        if limit < 1 or limit > STRANDED_RECONCILIATION_LIMIT:
+            raise ValueError(
+                f"Reconciliation limit must be between 1 and {STRANDED_RECONCILIATION_LIMIT}."
+            )
+        cutoff = before or utc_now()
+        statement = (
+            select(Task.id)
+            .where(Task.status == TaskStatus.EXECUTING, Task.updated_at <= cutoff)
+            .order_by(Task.updated_at, Task.id)
+            .limit(limit)
+        )
+        try:
+            task_ids = tuple(self._session.scalars(statement))
+        except SQLAlchemyError as exc:
+            self._rollback()
+            raise TaskPersistenceError from exc
+
+        reconciled = 0
+        for task_id in task_ids:
+            if self._reconcile_stranded_execution(task_id):
+                reconciled += 1
+        return reconciled
+
+    def _reconcile_stranded_execution(self, task_id: UUID) -> bool:
+        statement = (
+            select(Task)
+            .where(Task.id == task_id)
+            .options(
+                selectinload(Task.execution).selectinload(Execution.tool_calls),
+                selectinload(Task.execution).selectinload(Execution.approval),
+            )
+            .with_for_update()
+        )
+        try:
+            task = self._session.scalar(statement)
+            if (
+                task is None
+                or task.status is not TaskStatus.EXECUTING
+                or task.execution is None
+                or task.execution.status is not ExecutionStatus.RUNNING
+                or len(task.execution.tool_calls) != 1
+                or task.execution.tool_calls[0].status is not ToolCallStatus.RUNNING
+            ):
+                self._session.rollback()
+                return False
+
+            execution = task.execution
+            tool_call = execution.tool_calls[0]
+            approved_write = (
+                execution.approval is not None
+                and execution.approval.decision is ApprovalDecision.APPROVED
+            )
+            completed_at = utc_now()
+            if approved_write:
+                task_target = TaskStatus.OUTCOME_UNCERTAIN
+                execution_target = ExecutionStatus.OUTCOME_UNCERTAIN
+                tool_call_target = ToolCallStatus.OUTCOME_UNCERTAIN
+                message = UNCERTAIN_OUTCOME_MESSAGE
+            else:
+                task_target = TaskStatus.FAILED
+                execution_target = ExecutionStatus.FAILED
+                tool_call_target = ToolCallStatus.FAILED
+                message = INTERRUPTED_EXECUTION_MESSAGE
+
+            _transition_task(task, task_target)
+            _transition_execution(execution, execution_target)
+            _transition_tool_call(tool_call, tool_call_target)
+            task.result = None
+            task.error = message
+            execution.result = None
+            execution.error = message
+            execution.completed_at = completed_at
+            tool_call.result = None
+            tool_call.error = message
+            tool_call.completed_at = completed_at
+            self._session.commit()
             return True
+        except SQLAlchemyError as exc:
+            self._rollback()
+            logger.error(
+                "stranded execution reconciliation failed task_id=%s error_type=%s",
+                task_id,
+                type(exc).__name__,
+                extra={
+                    "task_id": str(task_id),
+                    "persistence_operation": "reconcile_stranded_execution",
+                    "database_error_type": type(exc).__name__,
+                },
+            )
+            raise TaskPersistenceError from exc
 
     def _rollback(self) -> bool:
         try:

@@ -4,11 +4,11 @@
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![React](https://img.shields.io/badge/React-TypeScript-149ECA.svg?logo=react&logoColor=white)](https://react.dev/)
 
-AURA is an agentic workspace and AI orchestration platform conceived as a portfolio-grade software engineering project. The repository is currently at **Phase 3: tooling and approvals**: a user can create a one-step task, let the configured planner choose among bounded workspace tools, and explicitly approve or reject file moves before execution.
+AURA is an agentic workspace and AI orchestration platform conceived as a portfolio-grade software engineering project. The repository is currently at **Phase 3.2: lifecycle and decision-boundary hardening**: a user can create a one-step task, let the configured planner choose among bounded workspace tools, and explicitly approve or reject file moves before execution.
 
 The project scope and implementation order are governed by [`AURA_Project_Blueprint_A3.pdf`](AURA_Project_Blueprint_A3.pdf).
 
-## Phase 3 capabilities
+## Phase 3.2 capabilities
 
 - FastAPI application with a typed `GET /api/health` endpoint and OpenAPI documentation.
 - Typed task creation/retrieval endpoints plus payload-free approval and rejection endpoints for persisted pending executions.
@@ -16,12 +16,15 @@ The project scope and implementation order are governed by [`AURA_Project_Bluepr
 - Vendor-neutral `AIProvider` contract and an OpenAI Responses API adapter selected through environment configuration.
 - `LLMPlanner` that receives all registered tool schemas, requests strict structured output, and locally validates exactly one selected tool call before persistence or execution.
 - Explicit application-owned `READ`/`WRITE` permissions: reads execute automatically and writes cannot execute without approval.
+- Origin-checked browser decisions with an action-matching `X-AURA-Decision` preflight header; decision bodies never supply tool arguments.
 - `workspace_list`, bounded literal `workspace_search`, bounded UTF-8 `workspace_read`, and approval-required `workspace_move` tools.
 - Descriptor/handle-anchored workspace acquisition that rejects symlinks, reparse points, special files, escapes, and stale workspace or source identities.
 - Atomic no-overwrite moves (`renameat2(RENAME_NOREPLACE)` on Linux and handle-based rename on Windows), with fail-closed behavior when the required primitive is unavailable.
 - Explicit list/search budgets for entries, directories, depth, traversal work, scanned bytes, result count, and returned bytes, with truncation reported in tool results.
 - PostgreSQL persistence for tasks, plans, executions, tool calls, approval decisions, application-generated filesystem preconditions, statuses, and results through SQLAlchemy and Alembic.
-- React, TypeScript, and Vite UI for planning, waiting, executing, completed, rejected, and failed states, including guarded Approve/Reject controls.
+- Operation-specific, task-row-locked persistence recovery that cannot overwrite newer decisions or terminal outcomes.
+- Explicit persisted `outcome_uncertain` state for approved WRITEs whose durable completion is unknown, plus bounded startup reconciliation without mutation replay.
+- React, TypeScript, and Vite UI for planning, waiting, executing, completed, rejected, failed, and uncertain states, including guarded Approve/Reject controls.
 - Reproducible local services through Docker Compose.
 - Backend linting, formatting, static typing, tests, and coverage enforcement.
 - Frontend linting, formatting, static typing, tests, and production builds.
