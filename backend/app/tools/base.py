@@ -11,6 +11,10 @@ class PermissionLevel(StrEnum):
     WRITE = "write"
 
 
+class MutationOutcomeUnknown(RuntimeError):
+    """A mutating primitive was accepted but its outcome cannot be established."""
+
+
 class ToolDefinition(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

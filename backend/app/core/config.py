@@ -13,6 +13,11 @@ class PlannerBackend(StrEnum):
     OPENAI = "openai"
 
 
+class WorkspaceWriteMode(StrEnum):
+    READ_ONLY = "read_only"
+    DOCKER_MANAGED = "docker_managed"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
@@ -26,6 +31,7 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://aura:aura@localhost:5432/aura"
     cors_origins: list[str] = ["http://localhost:5173"]
     workspace_root: Path = PROJECT_ROOT / "workspace"
+    workspace_write_mode: WorkspaceWriteMode = WorkspaceWriteMode.READ_ONLY
     planner_backend: PlannerBackend = PlannerBackend.MOCK
     openai_api_key: SecretStr | None = None
     openai_model: str = Field(default="gpt-5-mini", min_length=1, max_length=40)

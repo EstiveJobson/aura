@@ -1,6 +1,7 @@
 """Task lifecycle and approval coordination services."""
 
 from app.services.tasks import (
+    ReconciliationReport,
     TaskNotFoundError,
     TaskPersistenceError,
     TaskService,
@@ -12,4 +13,5 @@ __all__ = [
     "TaskPersistenceError",
     "TaskService",
     "TaskStateConflictError",
+    "ReconciliationReport",
 ]

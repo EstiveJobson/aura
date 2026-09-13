@@ -11,8 +11,9 @@ from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 
-from app.agents.engine import AgentEngine, AgentExecutionError
+from app.agents.engine import AgentEngine, AgentExecutionError, AgentMutationOutcomeUnknown
 from app.agents.planner import ExecutionPlan
+from app.database.ownership import ExecutionOwnership
 from app.models import (
     Approval,
     ApprovalDecision,
@@ -62,6 +63,12 @@ class RecoveryPolicy:
     expected_tool_call_status: ToolCallStatus | None
     expected_approval_decision: ApprovalDecision | None
     target: RecoveryTarget
+
+
+@dataclass(frozen=True)
+class ReconciliationReport:
+    reconciled: int
+    remaining: bool
 
 
 PENDING_TASK_FAILURE = RecoveryPolicy(
@@ -222,11 +229,18 @@ def _transition_approval(approval: Approval, target: ApprovalDecision) -> None:
 
 
 class TaskService:
-    def __init__(self, session: Session, agent_engine: AgentEngine) -> None:
+    def __init__(
+        self,
+        session: Session,
+        agent_engine: AgentEngine,
+        execution_ownership: ExecutionOwnership,
+    ) -> None:
         self._session = session
         self._agent_engine = agent_engine
+        self._execution_ownership = execution_ownership
 
     def create_and_execute(self, instruction: str) -> Task:
+        self._execution_ownership.assert_owned()
         task = Task(id=uuid4(), instruction=instruction, status=TaskStatus.PENDING)
         self._session.add(task)
         self._commit_or_raise(
@@ -309,6 +323,7 @@ class TaskService:
                     recovery_policy=PLANNING_TASK_FAILURE,
                 )
 
+                self._execution_ownership.assert_owned()
                 outcome = self._agent_engine.execute(plan)
                 self._complete_execution(
                     task,
@@ -325,6 +340,7 @@ class TaskService:
         return self._reload_created_task(task, execution, tool_call)
 
     def approve(self, task_id: UUID) -> Task:
+        self._execution_ownership.assert_owned()
         task = self._get_for_decision(task_id)
         execution, tool_call, approval = self._require_waiting_for_approval(task)
         plan = self._execution_plan(task)
@@ -347,6 +363,7 @@ class TaskService:
         )
 
         try:
+            self._execution_ownership.assert_owned()
             outcome = self._agent_engine.execute(
                 plan,
                 approved=True,
@@ -362,6 +379,12 @@ class TaskService:
             )
         except _TaskOutcomeUncertainError:
             return self._reload_created_task(task, execution, tool_call)
+        except AgentMutationOutcomeUnknown as exc:
+            self._log_execution_failure(exc, task, execution, tool_call)
+            try:
+                self._mark_execution_outcome_uncertain(task, execution, tool_call)
+            except _TaskOutcomeUncertainError:
+                return self._reload_created_task(task, execution, tool_call)
         except AgentExecutionError as exc:
             self._log_execution_failure(exc, task, execution, tool_call)
             self._mark_execution_failed(task, execution, tool_call, str(exc))
@@ -525,6 +548,10 @@ class TaskService:
         *,
         uncertain_on_persistence_failure: bool,
     ) -> None:
+        locked = self._lock_running_lifecycle(task.id, execution.id, tool_call.id)
+        if locked is None:
+            return
+        task, execution, tool_call = locked
         completed_at = utc_now()
         _transition_tool_call(tool_call, ToolCallStatus.SUCCEEDED)
         tool_call.result = output
@@ -557,6 +584,10 @@ class TaskService:
         tool_call: ToolCall | None,
         error: str,
     ) -> None:
+        locked = self._lock_failure_lifecycle(task, execution, tool_call)
+        if locked is None:
+            return
+        task, execution, tool_call = locked
         completed_at = utc_now()
         if tool_call is not None:
             _transition_tool_call(tool_call, ToolCallStatus.FAILED)
@@ -584,6 +615,102 @@ class TaskService:
             tool_call,
             recovery_policy=recovery_policy,
         )
+
+    def _mark_execution_outcome_uncertain(
+        self,
+        task: Task,
+        execution: Execution,
+        tool_call: ToolCall,
+    ) -> None:
+        locked = self._lock_running_lifecycle(task.id, execution.id, tool_call.id)
+        if locked is None:
+            return
+        persisted_task, persisted_execution, persisted_tool_call = locked
+        completed_at = utc_now()
+        _transition_tool_call(persisted_tool_call, ToolCallStatus.OUTCOME_UNCERTAIN)
+        persisted_tool_call.result = None
+        persisted_tool_call.error = UNCERTAIN_OUTCOME_MESSAGE
+        persisted_tool_call.completed_at = completed_at
+        _transition_execution(persisted_execution, ExecutionStatus.OUTCOME_UNCERTAIN)
+        persisted_execution.result = None
+        persisted_execution.error = UNCERTAIN_OUTCOME_MESSAGE
+        persisted_execution.completed_at = completed_at
+        _transition_task(persisted_task, TaskStatus.OUTCOME_UNCERTAIN)
+        persisted_task.result = None
+        persisted_task.error = UNCERTAIN_OUTCOME_MESSAGE
+        self._commit_or_raise(
+            "record_uncertain_mutation",
+            persisted_task,
+            persisted_execution,
+            persisted_tool_call,
+            recovery_policy=WRITE_COMPLETION_UNCERTAIN,
+        )
+
+    def _lock_failure_lifecycle(
+        self,
+        task: Task,
+        execution: Execution | None,
+        tool_call: ToolCall | None,
+    ) -> tuple[Task, Execution | None, ToolCall | None] | None:
+        self._execution_ownership.assert_owned()
+        if execution is not None and tool_call is not None:
+            locked = self._lock_running_lifecycle(task.id, execution.id, tool_call.id)
+            if locked is None:
+                return None
+            return locked
+
+        statement = (
+            select(Task)
+            .where(Task.id == task.id, Task.status == task.status)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        try:
+            persisted_task = self._session.scalar(statement)
+        except SQLAlchemyError as exc:
+            self._rollback()
+            raise TaskPersistenceError from exc
+        if persisted_task is None or persisted_task.execution is not None:
+            self._session.rollback()
+            return None
+        return persisted_task, None, None
+
+    def _lock_running_lifecycle(
+        self,
+        task_id: UUID,
+        execution_id: UUID,
+        tool_call_id: UUID,
+    ) -> tuple[Task, Execution, ToolCall] | None:
+        self._execution_ownership.assert_owned()
+        statement = (
+            select(Task, Execution, ToolCall)
+            .join(Execution, Execution.task_id == Task.id)
+            .join(ToolCall, ToolCall.execution_id == Execution.id)
+            .where(
+                Task.id == task_id,
+                Execution.id == execution_id,
+                ToolCall.id == tool_call_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        try:
+            row = self._session.execute(statement).one_or_none()
+        except SQLAlchemyError as exc:
+            self._rollback()
+            raise TaskPersistenceError from exc
+        if row is None:
+            self._session.rollback()
+            return None
+        persisted_task, persisted_execution, persisted_tool_call = row._tuple()
+        if (
+            persisted_task.status is not TaskStatus.EXECUTING
+            or persisted_execution.status is not ExecutionStatus.RUNNING
+            or persisted_tool_call.status is not ToolCallStatus.RUNNING
+        ):
+            self._session.rollback()
+            return None
+        return persisted_task, persisted_execution, persisted_tool_call
 
     def _commit_or_raise(
         self,
@@ -815,6 +942,16 @@ class TaskService:
         limit: int = STRANDED_RECONCILIATION_LIMIT,
     ) -> int:
         """Finalize a bounded startup batch without ever re-executing a tool."""
+        return self.reconcile_stranded_execution_batch(before=before, limit=limit).reconciled
+
+    def reconcile_stranded_execution_batch(
+        self,
+        *,
+        before: datetime | None = None,
+        limit: int = STRANDED_RECONCILIATION_LIMIT,
+    ) -> ReconciliationReport:
+        """Finalize one bounded owned batch and report whether another batch remains."""
+        self._execution_ownership.assert_owned()
         if limit < 1 or limit > STRANDED_RECONCILIATION_LIMIT:
             raise ValueError(
                 f"Reconciliation limit must be between 1 and {STRANDED_RECONCILIATION_LIMIT}."
@@ -824,7 +961,7 @@ class TaskService:
             select(Task.id)
             .where(Task.status == TaskStatus.EXECUTING, Task.updated_at <= cutoff)
             .order_by(Task.updated_at, Task.id)
-            .limit(limit)
+            .limit(limit + 1)
         )
         try:
             task_ids = tuple(self._session.scalars(statement))
@@ -832,11 +969,16 @@ class TaskService:
             self._rollback()
             raise TaskPersistenceError from exc
 
+        batch_ids = task_ids[:limit]
         reconciled = 0
-        for task_id in task_ids:
+        for task_id in batch_ids:
+            self._execution_ownership.assert_owned()
             if self._reconcile_stranded_execution(task_id):
                 reconciled += 1
-        return reconciled
+        return ReconciliationReport(
+            reconciled=reconciled,
+            remaining=len(task_ids) > limit,
+        )
 
     def _reconcile_stranded_execution(self, task_id: UUID) -> bool:
         statement = (

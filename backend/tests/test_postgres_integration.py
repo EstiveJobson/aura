@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents import AgentEngine, GeneratedPlan, MockPlanner, PlannedStep, Planner
 from app.core.config import PlannerBackend, Settings
+from app.database.ownership import BackendOwnershipError, PostgreSQLExecutionOwnership
 from app.database.session import create_database_engine, create_session_factory
 from app.main import create_app
 from app.models import (
@@ -24,6 +25,7 @@ from app.models import (
     ApprovalDecision,
     Execution,
     ExecutionStatus,
+    Plan,
     Task,
     TaskStatus,
     ToolCall,
@@ -45,6 +47,68 @@ from app.tools import (
 )
 
 pytestmark = pytest.mark.postgres
+
+
+class TestExecutionOwnership:
+    def assert_owned(self) -> None:
+        return None
+
+
+class AllowWorkspaceWrites:
+    def assert_write_allowed(self) -> None:
+        return None
+
+
+TEST_OWNERSHIP = TestExecutionOwnership()
+WRITE_ACCESS = AllowWorkspaceWrites()
+
+
+def build_read_engine(workspace_root: Path) -> AgentEngine:
+    registry = ToolRegistry()
+    registry.register(WorkspaceListTool(workspace_root))
+    return AgentEngine(
+        MockPlanner(),
+        ToolExecutor(registry),
+        planner_name="postgres-ownership-test-planner",
+    )
+
+
+def seed_stranded_executions(
+    session_factory: sessionmaker[Session],
+    count: int,
+) -> list[UUID]:
+    task_ids: list[UUID] = []
+    with session_factory() as session:
+        for index in range(count):
+            task = Task(instruction=f"stranded read {index}", status=TaskStatus.EXECUTING)
+            plan = Plan(
+                task=task,
+                planner="postgres-ownership-test-planner",
+                summary="Persist a stranded read.",
+                steps=[
+                    {
+                        "sequence": 1,
+                        "title": "List workspace",
+                        "tool_name": "workspace_list",
+                        "arguments": {},
+                    }
+                ],
+            )
+            execution = Execution(task=task, status=ExecutionStatus.RUNNING)
+            session.add_all((task, plan, execution))
+            session.flush()
+            session.add(
+                ToolCall(
+                    execution=execution,
+                    plan_id=plan.id,
+                    tool_name="workspace_list",
+                    arguments={},
+                    status=ToolCallStatus.RUNNING,
+                )
+            )
+            task_ids.append(task.id)
+        session.commit()
+    return task_ids
 
 
 class PostgreSQLFailurePlanner:
@@ -96,7 +160,7 @@ class PostgreSQLFailureTool:
 
 class CountingWorkspaceMoveTool(WorkspaceMoveTool):
     def __init__(self, workspace_root: Path) -> None:
-        super().__init__(workspace_root)
+        super().__init__(workspace_root, WRITE_ACCESS)
         self._invocations = 0
         self._lock = threading.Lock()
 
@@ -189,6 +253,11 @@ async def request(
         return await client.request(method, path, json=json, headers=request_headers)
 
 
+async def run_application_lifespan(application: FastAPI) -> None:
+    async with application.router.lifespan_context(application):
+        pass
+
+
 def build_postgres_application(
     tmp_path: Path,
     session_factory: sessionmaker[Session],
@@ -203,7 +272,7 @@ def build_postgres_application(
         registry.register(PostgreSQLFailureTool())
         planner = PostgreSQLFailurePlanner()
     elif approval:
-        registry.register(move_tool or WorkspaceMoveTool(tmp_path))
+        registry.register(move_tool or WorkspaceMoveTool(tmp_path, WRITE_ACCESS))
         planner = PostgreSQLMovePlanner()
     else:
         registry.register(WorkspaceListTool(tmp_path))
@@ -221,7 +290,127 @@ def build_postgres_application(
         ),
         session_factory=session_factory,
         agent_engine=engine,
+        execution_ownership=TEST_OWNERSHIP,
     )
+
+
+def test_postgres_rejects_a_second_backend_execution_owner(
+    postgres_session_factory: sessionmaker[Session],
+) -> None:
+    database_engine = cast(Engine, postgres_session_factory.kw["bind"])
+
+    with PostgreSQLExecutionOwnership.acquire(database_engine):
+        with pytest.raises(BackendOwnershipError, match="already owns"):
+            PostgreSQLExecutionOwnership.acquire(database_engine)
+
+
+def test_second_backend_cannot_reconcile_live_work_owned_by_first_backend(
+    tmp_path: Path,
+    postgres_session_factory: sessionmaker[Session],
+) -> None:
+    task_id = seed_stranded_executions(postgres_session_factory, 1)[0]
+    database_engine = cast(Engine, postgres_session_factory.kw["bind"])
+    application = create_app(
+        Settings(
+            database_url=os.environ["AURA_POSTGRES_TEST_URL"],
+            workspace_root=tmp_path,
+            planner_backend=PlannerBackend.MOCK,
+        ),
+        session_factory=postgres_session_factory,
+        agent_engine=build_read_engine(tmp_path),
+    )
+
+    with PostgreSQLExecutionOwnership.acquire(database_engine):
+        with pytest.raises(BackendOwnershipError, match="already owns"):
+            asyncio.run(run_application_lifespan(application))
+
+    with postgres_session_factory() as session:
+        task = session.get(Task, task_id)
+        assert task is not None and task.status is TaskStatus.EXECUTING
+
+
+def test_postgres_completion_never_overwrites_terminal_or_uncertain_lifecycle(
+    tmp_path: Path,
+    postgres_session_factory: sessionmaker[Session],
+) -> None:
+    for task_status, execution_status, tool_status in (
+        (
+            TaskStatus.OUTCOME_UNCERTAIN,
+            ExecutionStatus.OUTCOME_UNCERTAIN,
+            ToolCallStatus.OUTCOME_UNCERTAIN,
+        ),
+        (TaskStatus.FAILED, ExecutionStatus.FAILED, ToolCallStatus.FAILED),
+    ):
+        task_id = seed_stranded_executions(postgres_session_factory, 1)[0]
+        with postgres_session_factory() as stale_session:
+            task = stale_session.get(Task, task_id)
+            execution = stale_session.scalar(select(Execution).where(Execution.task_id == task_id))
+            assert execution is not None
+            tool_call = stale_session.scalar(
+                select(ToolCall).where(ToolCall.execution_id == execution.id)
+            )
+            assert task is not None and tool_call is not None
+
+            with postgres_session_factory() as winning_session:
+                winning_task = winning_session.get(Task, task_id)
+                winning_execution = winning_session.get(Execution, execution.id)
+                winning_tool_call = winning_session.get(ToolCall, tool_call.id)
+                assert winning_task is not None
+                assert winning_execution is not None
+                assert winning_tool_call is not None
+                winning_task.status = task_status
+                winning_task.error = "winning terminal state"
+                winning_execution.status = execution_status
+                winning_execution.error = "winning terminal state"
+                winning_tool_call.status = tool_status
+                winning_tool_call.error = "winning terminal state"
+                winning_session.commit()
+
+            TaskService(
+                stale_session,
+                build_read_engine(tmp_path),
+                TEST_OWNERSHIP,
+            )._complete_execution(
+                task,
+                execution,
+                tool_call,
+                {"summary": "must not win"},
+                "must not win",
+                uncertain_on_persistence_failure=False,
+            )
+
+        with postgres_session_factory() as verification_session:
+            persisted_task = verification_session.get(Task, task_id)
+            assert persisted_task is not None
+            assert persisted_task.status is task_status
+            assert persisted_task.error == "winning terminal state"
+
+
+def test_postgres_reconciliation_backlog_can_be_continued_in_bounded_batches(
+    tmp_path: Path,
+    postgres_session_factory: sessionmaker[Session],
+) -> None:
+    seed_stranded_executions(postgres_session_factory, 3)
+    database_engine = cast(Engine, postgres_session_factory.kw["bind"])
+
+    with PostgreSQLExecutionOwnership.acquire(database_engine) as ownership:
+        with postgres_session_factory() as session:
+            first = TaskService(
+                session,
+                build_read_engine(tmp_path),
+                ownership,
+            ).reconcile_stranded_execution_batch(limit=2)
+        with postgres_session_factory() as session:
+            second = TaskService(
+                session,
+                build_read_engine(tmp_path),
+                ownership,
+            ).reconcile_stranded_execution_batch(limit=2)
+
+    assert first.reconciled == 2
+    assert first.remaining is True
+    assert second.reconciled == 1
+    assert second.remaining is False
 
 
 def test_postgres_create_and_get_round_trip(

@@ -4,11 +4,11 @@
 [![Python 3.13](https://img.shields.io/badge/Python-3.13-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![React](https://img.shields.io/badge/React-TypeScript-149ECA.svg?logo=react&logoColor=white)](https://react.dev/)
 
-AURA is an agentic workspace and AI orchestration platform conceived as a portfolio-grade software engineering project. The repository is currently at **Phase 3.2: lifecycle and decision-boundary hardening**: a user can create a one-step task, let the configured planner choose among bounded workspace tools, and explicitly approve or reject file moves before execution.
+AURA is an agentic workspace and AI orchestration platform conceived as a portfolio-grade software engineering project. The repository is at the **final Phase 3 hardening boundary**: a user can create a one-step task, let the configured planner choose among bounded workspace tools, and explicitly approve or reject supported file moves before execution.
 
 The project scope and implementation order are governed by [`AURA_Project_Blueprint_A3.pdf`](AURA_Project_Blueprint_A3.pdf).
 
-## Phase 3.2 capabilities
+## Final Phase 3 capabilities
 
 - FastAPI application with a typed `GET /api/health` endpoint and OpenAPI documentation.
 - Typed task creation/retrieval endpoints plus payload-free approval and rejection endpoints for persisted pending executions.
@@ -19,11 +19,14 @@ The project scope and implementation order are governed by [`AURA_Project_Bluepr
 - Origin-checked browser decisions with an action-matching `X-AURA-Decision` preflight header; decision bodies never supply tool arguments.
 - `workspace_list`, bounded literal `workspace_search`, bounded UTF-8 `workspace_read`, and approval-required `workspace_move` tools.
 - Descriptor/handle-anchored workspace acquisition that rejects symlinks, reparse points, special files, escapes, and stale workspace or source identities.
-- Atomic no-overwrite moves (`renameat2(RENAME_NOREPLACE)` on Linux and handle-based rename on Windows), with fail-closed behavior when the required primitive is unavailable.
-- Explicit list/search budgets for entries, directories, depth, traversal work, scanned bytes, result count, and returned bytes, with truncation reported in tool results.
+- Atomic no-overwrite moves through `renameat2(RENAME_NOREPLACE)` in the supported Linux runtime, with fail-closed behavior when the required primitive is unavailable and no weaker fallback.
+- WRITE is disabled by default and supported only in the Linux Docker deployment when `/workspace` is a distinct, local, Docker-managed volume; host bind mounts, native execution, remote filesystems, and unvalidated mounts fail closed before mutation.
+- Explicit list/search budgets for entries, directories, depth, traversal work, every consumed probe byte, result count, and returned bytes, with truncation reported in tool results.
 - PostgreSQL persistence for tasks, plans, executions, tool calls, approval decisions, application-generated filesystem preconditions, statuses, and results through SQLAlchemy and Alembic.
-- Operation-specific, task-row-locked persistence recovery that cannot overwrite newer decisions or terminal outcomes.
-- Explicit persisted `outcome_uncertain` state for approved WRITEs whose durable completion is unknown, plus bounded startup reconciliation without mutation replay.
+- Operation-specific persistence recovery plus locked lifecycle reloads before tool completion/failure, so stale work cannot overwrite newer terminal or uncertain outcomes.
+- Explicit persisted `outcome_uncertain` state for approved WRITEs whose filesystem or durable completion is unknown, with no automatic mutation replay.
+- One PostgreSQL session advisory lock owns synchronous execution and reconciliation for the local monolith. A second backend fails startup before reconciliation.
+- Bounded startup reconciliation reports remaining backlog; an explicit one-batch CLI continuation uses the same exclusive ownership lock.
 - React, TypeScript, and Vite UI for planning, waiting, executing, completed, rejected, failed, and uncertain states, including guarded Approve/Reject controls.
 - Reproducible local services through Docker Compose.
 - Backend linting, formatting, static typing, tests, and coverage enforcement.
@@ -66,7 +69,9 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-The backend applies pending Alembic migrations before starting the API. Application code remains under `/app`, while the host `workspace/` directory is mounted at the isolated container path `/workspace`. Every tool accepts only validated paths relative to that workspace root and acquires objects through that root. `workspace_move` never overwrites, always waits for explicit approval, and rejects an approval if the workspace or approved source identity changed while it was pending.
+The backend applies pending Alembic migrations before starting the API. Application code remains under `/app`; it is not mounted into the workspace. Compose mounts the dedicated Docker-managed `aura_workspace` volume at `/workspace` and explicitly sets `WORKSPACE_WRITE_MODE=docker_managed`. At startup AURA requires that exact path to be a distinct Docker-volume mount backed by an allowlisted local filesystem. `workspace_move` retains atomic `RENAME_NOREPLACE`, never overwrites, waits for explicit approval, and rejects an approval if the workspace or approved source identity changed while it was pending.
+
+The Docker-managed volume is the only supported WRITE deployment. AURA does not claim safe mutation on arbitrary host paths, bind mounts, shared/remote filesystems, or native Windows. Those environments use `WORKSPACE_WRITE_MODE=read_only`; bounded READ tools remain available, while WRITE fails before approval context capture or mutation. Do not change the mode to claim guarantees the runtime cannot establish.
 
 The local development defaults in `.env.example` are not production credentials. Change them for any shared environment.
 
@@ -74,7 +79,17 @@ The local development defaults in `.env.example` are not production credentials.
 - API health: <http://localhost:8000/api/health>
 - API documentation: <http://localhost:8000/docs>
 
-Stop the stack with `docker compose down`. Add `--volumes` only when you explicitly want to delete the local PostgreSQL data volume.
+Stop the stack with `docker compose down`. Add `--volumes` only when you explicitly want to delete both local PostgreSQL data and the managed workspace.
+
+If startup reports a reconciliation backlog, stop the backend, run exactly one owned bounded continuation, inspect the JSON `remaining` flag, and restart the backend:
+
+```powershell
+docker compose stop backend
+docker compose run --rm backend python -m app.reconcile --limit 100
+docker compose up -d backend
+```
+
+The command refuses to run while the backend holds execution ownership. Repeat it manually only while `remaining` is `true`; it never invokes a tool or replays a WRITE.
 
 ## Run without containers
 
@@ -99,7 +114,7 @@ npm run dev
 
 Copy `.env.example` to `.env` before starting the backend and adjust `DATABASE_URL` when PostgreSQL is not on `localhost:5432`.
 
-The backend always loads the repository-root `.env`, matching the documented copy location. The example uses `WORKSPACE_ROOT=../workspace` because the local backend command runs from `backend/`; Docker Compose uses the matching isolated container path `/workspace`.
+The backend always loads the repository-root `.env`, matching the documented copy location. The native example uses `WORKSPACE_ROOT=../workspace` with `WORKSPACE_WRITE_MODE=read_only`; Docker Compose overrides both values for its managed volume. PostgreSQL is required for execution ownership. Native runs remain useful for READ-only development and tests, but are not a supported WRITE deployment.
 
 `PLANNER_BACKEND=mock` is the default and requires no provider credentials. To use the real provider, set these values in the untracked root `.env` before starting the backend:
 
@@ -140,6 +155,7 @@ Backend coverage is enforced at 80%. Frontend tests use Vitest. The automated su
 | `DATABASE_URL`      | SQLAlchemy PostgreSQL connection URL.             |
 | `CORS_ORIGINS`      | JSON array of browser origins allowed by FastAPI. |
 | `WORKSPACE_ROOT`    | Fixed directory available to bounded workspace tools. |
+| `WORKSPACE_WRITE_MODE` | `read_only` (default) or validated Compose-only `docker_managed`. |
 | `PLANNER_BACKEND`   | `mock` (default) or `openai`.                      |
 | `OPENAI_API_KEY`    | Required only when `PLANNER_BACKEND=openai`.       |
 | `OPENAI_MODEL`      | OpenAI model used for structured planning.         |

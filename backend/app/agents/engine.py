@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.agents.planner import ExecutionPlan, GeneratedPlan, Planner
 from app.core.constraints import PLANNER_NAME_MAX_LENGTH
-from app.tools.registry import ToolError, ToolExecutor
+from app.tools.registry import ToolError, ToolExecutor, ToolMutationOutcomeUnknown
 
 
 class AgentExecutionError(RuntimeError):
@@ -19,6 +19,10 @@ class AgentExecutionError(RuntimeError):
     ) -> None:
         super().__init__(message)
         self.stage = stage
+
+
+class AgentMutationOutcomeUnknown(AgentExecutionError):
+    """A WRITE reached the filesystem but could not establish its outcome."""
 
 
 class PlannerIdentity(BaseModel):
@@ -106,6 +110,8 @@ class AgentEngine:
                 approved=approved,
                 approval_context=approval_context,
             )
+        except ToolMutationOutcomeUnknown as exc:
+            raise AgentMutationOutcomeUnknown(str(exc), stage="tool") from exc
         except ToolError as exc:
             raise AgentExecutionError(str(exc), stage="tool") from exc
 

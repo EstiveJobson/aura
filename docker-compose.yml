@@ -22,6 +22,7 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-aura}:${POSTGRES_PASSWORD:-aura}@db:5432/${POSTGRES_DB:-aura}
       CORS_ORIGINS: '["http://localhost:5173"]'
       WORKSPACE_ROOT: /workspace
+      WORKSPACE_WRITE_MODE: docker_managed
       PLANNER_BACKEND: ${PLANNER_BACKEND:-mock}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
@@ -33,7 +34,7 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - ./workspace:/workspace
+      - aura_workspace:/workspace
 
   frontend:
     build:
@@ -47,3 +48,6 @@ services:
 
 volumes:
   aura_postgres_data:
+  aura_workspace:
+    labels:
+      com.aura.workspace: exclusive-write
