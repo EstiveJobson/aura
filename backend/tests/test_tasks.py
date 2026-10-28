@@ -35,6 +35,7 @@ from app.services.tasks import (
     UNCERTAIN_OUTCOME_MESSAGE,
 )
 from app.tools import (
+    MutationOutcomeUnknown,
     PermissionLevel,
     ToolDefinition,
     ToolExecutor,
@@ -42,6 +43,20 @@ from app.tools import (
     WorkspaceListTool,
     WorkspaceMoveTool,
 )
+
+
+class TestExecutionOwnership:
+    def assert_owned(self) -> None:
+        return None
+
+
+class AllowWorkspaceWrites:
+    def assert_write_allowed(self) -> None:
+        return None
+
+
+TEST_OWNERSHIP = TestExecutionOwnership()
+WRITE_ACCESS = AllowWorkspaceWrites()
 
 
 class MissingToolPlanner:
@@ -77,6 +92,50 @@ class InvalidArgumentsPlanner:
                 ),
             ),
         )
+
+
+class UncertainMutationPlanner:
+    def create_plan(self, instruction: str) -> GeneratedPlan:
+        return GeneratedPlan(
+            summary="Exercise typed filesystem mutation uncertainty.",
+            steps=(
+                PlannedStep(
+                    sequence=1,
+                    title="Run an uncertain mutation",
+                    tool_name="uncertain_mutation",
+                    arguments={},
+                ),
+            ),
+        )
+
+
+class UncertainMutationTool:
+    def __init__(self) -> None:
+        self.invocations = 0
+
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="uncertain_mutation",
+            description="Raise the typed mutation uncertainty signal.",
+            permission=PermissionLevel.WRITE,
+            parameters={},
+        )
+
+    def validate_arguments(self, arguments: dict[str, Any]) -> None:
+        return None
+
+    def capture_approval_context(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        return {"test": "application-owned"}
+
+    def execute(
+        self,
+        arguments: dict[str, Any],
+        *,
+        approval_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.invocations += 1
+        raise MutationOutcomeUnknown("injected accepted-operation transport loss")
 
 
 class ExplodingToolPlanner:
@@ -171,7 +230,7 @@ class WriteCompletionCommitFailureSession(Session):
 
 class CountingWorkspaceMoveTool(WorkspaceMoveTool):
     def __init__(self, workspace_root: Path) -> None:
-        super().__init__(workspace_root)
+        super().__init__(workspace_root, WRITE_ACCESS)
         self.invocations = 0
 
     def execute(
@@ -210,6 +269,7 @@ def build_test_application(
         settings,
         session_factory=session_factory,
         agent_engine=agent_engine,
+        execution_ownership=TEST_OWNERSHIP,
     )
     return application, session_factory, engine
 
@@ -239,7 +299,7 @@ def build_move_engine(
     move_tool: WorkspaceMoveTool | None = None,
 ) -> AgentEngine:
     registry = ToolRegistry()
-    registry.register(move_tool or WorkspaceMoveTool(tmp_path))
+    registry.register(move_tool or WorkspaceMoveTool(tmp_path, WRITE_ACCESS))
     return AgentEngine(
         MovePlanner(),
         ToolExecutor(registry),
@@ -761,6 +821,7 @@ def test_post_mutation_completion_failure_persists_uncertainty_without_replay(
         reconciled = TaskService(
             session,
             application.state.agent_engine,
+            TEST_OWNERSHIP,
         ).reconcile_stranded_executions()
 
     assert fetched.status_code == 200
@@ -768,6 +829,56 @@ def test_post_mutation_completion_failure_persists_uncertainty_without_replay(
     assert duplicate.status_code == 409
     assert reconciled == 0
     assert move_tool.invocations == 1
+    engine.dispose()
+
+
+def test_typed_mutation_uncertainty_is_persisted_and_never_replayed(
+    tmp_path: Path,
+) -> None:
+    tool = UncertainMutationTool()
+    registry = ToolRegistry()
+    registry.register(tool)
+    agent_engine = AgentEngine(
+        UncertainMutationPlanner(),
+        ToolExecutor(registry),
+        planner_name="uncertain-mutation-test-planner",
+    )
+    application, session_factory, engine = build_test_application(
+        tmp_path,
+        agent_engine,
+        session_class=WriteCompletionCommitFailureSession,
+    )
+    created = asyncio.run(
+        request(
+            application,
+            "POST",
+            "/api/tasks",
+            json={"instruction": "Exercise uncertain mutation handling."},
+        )
+    ).json()
+
+    WriteCompletionCommitFailureSession.armed = True
+    try:
+        approved = asyncio.run(request(application, "POST", f"/api/tasks/{created['id']}/approve"))
+    finally:
+        WriteCompletionCommitFailureSession.armed = False
+    duplicate = asyncio.run(request(application, "POST", f"/api/tasks/{created['id']}/approve"))
+    with session_factory() as session:
+        report = TaskService(
+            session,
+            agent_engine,
+            TEST_OWNERSHIP,
+        ).reconcile_stranded_execution_batch()
+
+    assert approved.status_code == 200
+    assert approved.json()["status"] == "outcome_uncertain"
+    assert approved.json()["error"] == UNCERTAIN_OUTCOME_MESSAGE
+    assert approved.json()["execution"]["status"] == "outcome_uncertain"
+    assert approved.json()["execution"]["tool_calls"][0]["status"] == "outcome_uncertain"
+    assert duplicate.status_code == 409
+    assert tool.invocations == 1
+    assert report.reconciled == 0
+    assert report.remaining is False
     engine.dispose()
 
 
@@ -807,7 +918,14 @@ def test_stranded_approved_write_reconciliation_is_terminal_and_never_replays(
 
     asyncio.run(run_application_lifespan(application))
     with session_factory() as session:
-        assert TaskService(session, agent_engine).reconcile_stranded_executions() == 0
+        assert (
+            TaskService(
+                session,
+                agent_engine,
+                TEST_OWNERSHIP,
+            ).reconcile_stranded_executions()
+            == 0
+        )
 
     with session_factory() as session:
         task = session.scalar(select(Task))

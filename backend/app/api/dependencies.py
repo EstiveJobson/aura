@@ -5,6 +5,7 @@ from fastapi import Depends, Request
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.agents import AgentEngine
+from app.database.ownership import ExecutionOwnership
 from app.services import TaskService
 
 
@@ -19,7 +20,8 @@ DatabaseSession = Annotated[Session, Depends(get_database_session)]
 
 def get_task_service(request: Request, session: DatabaseSession) -> TaskService:
     agent_engine = cast(AgentEngine, request.app.state.agent_engine)
-    return TaskService(session, agent_engine)
+    ownership = cast(ExecutionOwnership, request.app.state.execution_ownership)
+    return TaskService(session, agent_engine, ownership)
 
 
 TaskServiceDependency = Annotated[TaskService, Depends(get_task_service)]

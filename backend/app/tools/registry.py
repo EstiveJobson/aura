@@ -1,6 +1,12 @@
 from typing import Any
 
-from app.tools.base import ApprovalBoundTool, PermissionLevel, Tool, ToolDefinition
+from app.tools.base import (
+    ApprovalBoundTool,
+    MutationOutcomeUnknown,
+    PermissionLevel,
+    Tool,
+    ToolDefinition,
+)
 
 
 class ToolError(RuntimeError):
@@ -9,6 +15,10 @@ class ToolError(RuntimeError):
 
 class ToolApprovalRequired(ToolError):
     """Raised when application policy blocks an unapproved mutation."""
+
+
+class ToolMutationOutcomeUnknown(ToolError):
+    """Preserves genuine mutation uncertainty across the tool boundary."""
 
 
 class ToolRegistry:
@@ -81,5 +91,9 @@ class ToolExecutor:
                     raise ToolError(f'Tool "{name}" is missing its persisted approval context.')
                 return tool.execute(arguments, approval_context=approval_context)
             return tool.execute(arguments)
+        except MutationOutcomeUnknown as exc:
+            raise ToolMutationOutcomeUnknown(
+                f'Tool "{name}" returned an uncertain mutation outcome.'
+            ) from exc
         except Exception as exc:
             raise ToolError(f'Tool "{name}" could not be executed safely.') from exc

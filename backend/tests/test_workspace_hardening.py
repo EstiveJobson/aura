@@ -35,15 +35,24 @@ from app.tools.workspace_search import (
     MAX_SCANNED_FILES,
     MAX_SEARCH_FILE_BYTES,
     MAX_SEARCH_RETURN_BYTES,
+    MAX_SEARCH_TOTAL_FILE_BYTES,
     MAX_SEARCH_TRAVERSAL_WORK,
     MAX_SEARCH_VISITED_DIRECTORIES,
     WorkspaceSearchArguments,
 )
 
 
+class AllowWorkspaceWrites:
+    def assert_write_allowed(self) -> None:
+        return None
+
+
+WRITE_ACCESS = AllowWorkspaceWrites()
+
+
 def _move_executor(root: Path) -> ToolExecutor:
     registry = ToolRegistry()
-    registry.register(WorkspaceMoveTool(root))
+    registry.register(WorkspaceMoveTool(root, WRITE_ACCESS))
     return ToolExecutor(registry)
 
 
@@ -287,6 +296,22 @@ def test_workspace_search_preserves_per_file_binary_and_size_limits(tmp_path: Pa
     assert result["matches"] == []
     assert result["scanned_files"] == 3
     assert result["truncated"] is False
+
+
+def test_oversized_search_probes_consume_the_shared_byte_budget(tmp_path: Path) -> None:
+    probe_size = MAX_SEARCH_FILE_BYTES + 1
+    file_count = (MAX_SEARCH_TOTAL_FILE_BYTES // probe_size) + 2
+    payload = b"x" * probe_size
+    for index in range(file_count):
+        (tmp_path / f"oversized-{index:03}.txt").write_bytes(payload)
+
+    result = WorkspaceSearchTool(tmp_path).execute(
+        {"query": "not-present", "path": ".", "max_results": 10}
+    )
+
+    assert result["truncated"] is True
+    assert result["scanned_file_bytes"] == MAX_SEARCH_TOTAL_FILE_BYTES
+    assert result["scanned_files"] < file_count
 
 
 def test_workspace_search_bounds_trees_with_many_empty_directories(tmp_path: Path) -> None:

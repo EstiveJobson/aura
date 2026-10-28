@@ -1,7 +1,13 @@
 import pytest
 from pydantic import SecretStr, ValidationError
 
-from app.core.config import PROJECT_ROOT, PlannerBackend, Settings, get_settings
+from app.core.config import (
+    PROJECT_ROOT,
+    PlannerBackend,
+    Settings,
+    WorkspaceWriteMode,
+    get_settings,
+)
 
 
 def test_settings_accept_foundation_configuration() -> None:
@@ -15,6 +21,7 @@ def test_settings_accept_foundation_configuration() -> None:
     assert settings.cors_origins == ["http://localhost:5173"]
     assert settings.database_url.startswith("postgresql+psycopg://")
     assert settings.planner_backend is PlannerBackend.MOCK
+    assert settings.workspace_write_mode is WorkspaceWriteMode.READ_ONLY
 
 
 def test_openai_configuration_requires_a_key_without_exposing_secrets() -> None:
@@ -54,7 +61,9 @@ def test_compose_mounts_only_the_dedicated_workspace() -> None:
     compose = (PROJECT_ROOT / "docker-compose.yml").read_text(encoding="utf-8")
 
     assert "WORKSPACE_ROOT: /workspace" in compose
-    assert "./workspace:/workspace" in compose
+    assert "aura_workspace:/workspace" in compose
+    assert "WORKSPACE_WRITE_MODE: docker_managed" in compose
+    assert "./workspace:/workspace" not in compose
     assert "WORKSPACE_ROOT: /app" not in compose
     assert (PROJECT_ROOT / "workspace" / ".gitignore").is_file()
 

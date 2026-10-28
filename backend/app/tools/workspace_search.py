@@ -159,7 +159,12 @@ class WorkspaceSearchTool:
                 read_limit = min(MAX_SEARCH_FILE_BYTES, remaining_file_bytes - 1)
                 try:
                     payload = self._boundary.read_regular_file(relative_path, read_limit)
-                except WorkspaceFileTooLarge:
+                except WorkspaceFileTooLarge as exc:
+                    scanned_file_bytes += exc.bytes_consumed
+                    if scanned_file_bytes >= MAX_SEARCH_TOTAL_FILE_BYTES:
+                        truncated = True
+                        stop = True
+                        break
                     if read_limit < MAX_SEARCH_FILE_BYTES:
                         truncated = True
                         stop = True

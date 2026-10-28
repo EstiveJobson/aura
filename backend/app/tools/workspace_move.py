@@ -4,6 +4,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.tools.base import PermissionLevel, ToolDefinition
+from app.tools.workspace_access import ReadOnlyWorkspaceAccess, WorkspaceWriteAccess
 from app.tools.workspace_paths import WorkspaceBoundary, validate_relative_path
 
 
@@ -36,8 +37,13 @@ class WorkspaceMoveArguments(BaseModel):
 class WorkspaceMoveTool:
     """Move one regular file within the workspace without overwriting."""
 
-    def __init__(self, workspace_root: Path) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        write_access: WorkspaceWriteAccess | None = None,
+    ) -> None:
         self._boundary = WorkspaceBoundary(workspace_root)
+        self._write_access = write_access or ReadOnlyWorkspaceAccess()
 
     @property
     def definition(self) -> ToolDefinition:
@@ -57,6 +63,7 @@ class WorkspaceMoveTool:
 
     def capture_approval_context(self, arguments: dict[str, Any]) -> dict[str, Any]:
         validated = WorkspaceMoveArguments.model_validate(arguments)
+        self._write_access.assert_write_allowed()
         return self._boundary.approval_context(validated.source)
 
     def execute(
@@ -68,6 +75,7 @@ class WorkspaceMoveTool:
         validated = WorkspaceMoveArguments.model_validate(arguments)
         if approval_context is None:
             raise ValueError("The persisted filesystem approval is required.")
+        self._write_access.assert_write_allowed()
         self._boundary.move_no_replace(
             validated.source,
             validated.destination,

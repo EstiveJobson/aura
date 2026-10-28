@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.agents import AgentEngine, GeneratedPlan, MockPlanner, PlannedStep
+from app.core.config import WorkspaceWriteMode
 from app.core.constraints import PLANNER_NAME_MAX_LENGTH, TOOL_NAME_MAX_LENGTH
 from app.tools import (
     MAX_READ_BYTES,
@@ -16,7 +17,17 @@ from app.tools import (
     WorkspaceMoveTool,
     WorkspaceReadTool,
     WorkspaceSearchTool,
+    WorkspaceWriteUnsupported,
+    build_workspace_write_access,
 )
+
+
+class AllowWorkspaceWrites:
+    def assert_write_allowed(self) -> None:
+        return None
+
+
+WRITE_ACCESS = AllowWorkspaceWrites()
 
 
 def test_mock_planner_is_deterministic_and_engine_applies_planner_identity(
@@ -162,7 +173,7 @@ def test_workspace_tools_reject_traversal_and_absolute_paths(
     registry = ToolRegistry()
     registry.register(WorkspaceSearchTool(tmp_path))
     registry.register(WorkspaceReadTool(tmp_path))
-    registry.register(WorkspaceMoveTool(tmp_path))
+    registry.register(WorkspaceMoveTool(tmp_path, WRITE_ACCESS))
 
     with pytest.raises(ToolError, match="received invalid arguments"):
         ToolExecutor(registry).validate_call(tool_name, arguments)
@@ -172,7 +183,7 @@ def test_workspace_move_requires_approval_and_never_overwrites(tmp_path: Path) -
     (tmp_path / "source.txt").write_text("source", encoding="utf-8")
     (tmp_path / "existing.txt").write_text("existing", encoding="utf-8")
     registry = ToolRegistry()
-    registry.register(WorkspaceMoveTool(tmp_path))
+    registry.register(WorkspaceMoveTool(tmp_path, WRITE_ACCESS))
     executor = ToolExecutor(registry)
     approval_context = executor.capture_approval_context(
         "workspace_move",
@@ -207,6 +218,35 @@ def test_workspace_move_requires_approval_and_never_overwrites(tmp_path: Path) -
     assert (tmp_path / "moved.txt").read_text(encoding="utf-8") == "source"
 
 
+def test_read_only_workspace_rejects_write_before_mutation_but_allows_read(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("read remains available", encoding="utf-8")
+    registry = ToolRegistry()
+    registry.register(WorkspaceReadTool(tmp_path))
+    registry.register(WorkspaceMoveTool(tmp_path))
+    executor = ToolExecutor(registry)
+
+    read_result = executor.execute("workspace_read", {"path": "source.txt"})
+
+    assert read_result["content"] == "read remains available"
+    with pytest.raises(ToolError, match="could not be prepared safely"):
+        executor.capture_approval_context(
+            "workspace_move",
+            {"source": "source.txt", "destination": "moved.txt"},
+        )
+    assert source.read_text(encoding="utf-8") == "read remains available"
+    assert not (tmp_path / "moved.txt").exists()
+
+
+def test_docker_managed_write_mode_rejects_an_unvalidated_workspace(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(WorkspaceWriteUnsupported):
+        build_workspace_write_access(tmp_path, WorkspaceWriteMode.DOCKER_MANAGED)
+
+
 @pytest.mark.parametrize("tool_kind", ["search", "read", "move"])
 def test_workspace_tools_reject_symlink_escape_where_supported(
     tmp_path: Path,
@@ -233,7 +273,7 @@ def test_workspace_tools_reject_symlink_escape_where_supported(
         with pytest.raises(ToolError, match="could not be executed safely"):
             ToolExecutor(registry).execute("workspace_read", {"path": "escape.txt"})
     else:
-        registry.register(WorkspaceMoveTool(tmp_path))
+        registry.register(WorkspaceMoveTool(tmp_path, WRITE_ACCESS))
         executor = ToolExecutor(registry)
         with pytest.raises(ToolError, match="could not be prepared safely"):
             executor.capture_approval_context(
